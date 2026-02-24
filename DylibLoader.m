@@ -6,11 +6,19 @@
 #import <unistd.h>
 #import <sys/stat.h>
 
+#define CONCAT_MACRO(A, B) A##B
+
 #define SEND_DEBUG(sock, fmt, ...) do { \
     char msg[512]; \
     snprintf(msg, sizeof(msg), fmt "\n", ##__VA_ARGS__); \
-    send(sock, msg, strlen(msg), 0); \
-} while (0)
+    if (sock >= 0) send(sock, msg, strlen(msg), 0); \
+} while (0);
+
+#define die_now() do { \
+    SEND_DEBUG(sock, "DYING!"); \
+    if (sock >= 0) close(sock); \
+    exit(1); \
+} while (0);
 
 __attribute__((constructor))
 static void init() {
@@ -26,15 +34,18 @@ static void init() {
     if (connect(sock, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
         NSLog(@"[DylibLoader] Could not connect to bridge.");
         close(sock);
-        return;
+        sock = -1;
+        die_now();
     }
 
     SEND_DEBUG(sock, "[DylibLoader] Connected. Preparing sandbox path...");
 
     // Get the absolute path to the sandbox Documents folder
     // NSHomeDirectory() is usually more stable than NSDocumentDirectory in LiveContainer
+    NSString *homeDir = NSHomeDirectory();
+    SEND_DEBUG(sock, "Home: %s", [homeDir UTF8String]);
     NSString *home = @"/private/var/mobile/Containers/Data/Application/EF9EB8C3-C3CA-4E39-92A6-A005FD1292EB/"; //NSHomeDirectory();
-    NSString *tempPath = [home stringByAppendingPathComponent:@"Documents/inbox.dylib"];
+    NSString *tempPath = [home stringByAppendingPathComponent:@"Documents/Tweaks/inbox.dylib"];
     const char *path = [tempPath UTF8String];
 
     // Clean start
@@ -43,8 +54,7 @@ static void init() {
     FILE *fp = fopen(path, "wb");
     if (!fp) {
         SEND_DEBUG(sock, "[DylibLoader] ERROR: Cannot open %s for writing. Check permissions.", path);
-        close(sock);
-        return;
+        die_now();
     }
 
     SEND_DEBUG(sock, "[DylibLoader] Receiving binary data...");
@@ -61,8 +71,7 @@ static void init() {
 
     if (total_received == 0) {
         SEND_DEBUG(sock, "[DylibLoader] ERROR: Received 0 bytes.");
-        close(sock);
-        return;
+        die_now();
     }
 
     // Ensure the kernel can execute the file
