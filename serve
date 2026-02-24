@@ -3,7 +3,7 @@
 # Usage: ./serve MicSpoof
 FILENAME=$1
 IP_MAC="192.168.1.23"
-P12_FILE="SidestoreSigningCertificate.p12"
+P12_FILE="SideStoreSigningCertificate.p12"
 P12_PASS="abc"
 
 if [ ! -f "$FILENAME.m" ]; then
