@@ -5,9 +5,11 @@
         "/usr/include/**",
         "/usr/local/include/**",
         "${workspaceFolder}/fishhook",
+        "${workspaceFolder}/utils",
     ],
     "clang.objcflags": [
         "-I${workspaceFolder}/LiveContainer",
         "-I${workspaceFolder}/fishhook",
+        "-I${workspaceFolder}/utils",
     ]
 }
