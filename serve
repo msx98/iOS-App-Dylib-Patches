@@ -1,0 +1,77 @@
+#!/bin/bash
+
+# Usage: ./serve MicSpoof
+FILENAME=$1
+IP_MAC="192.168.1.23"
+P12_FILE="SidestoreSigningCertificate.p12"
+P12_PASS="abc"
+
+if [ ! -f "$FILENAME.m" ]; then
+    echo "Error: $FILENAME.m does not exist"
+    exit 1
+fi
+
+set -e
+
+# 1. Build the Binary
+echo "[*] Compiling $FILENAME.m..."
+mkdir -p build 
+clang -dynamiclib -arch arm64 -isysroot $(xcrun --sdk iphoneos --show-sdk-path) \
+    -framework CoreAudio -framework AVFoundation -framework CoreMedia \
+    -framework CoreVideo -framework AudioToolbox -framework UIKit \
+    -framework Foundation -o build/$FILENAME.dylib $FILENAME.m
+
+# 2. Keychain Setup
+KC_NAME="$(pwd)/build/build.keychain"
+KC_PASS="temp"
+ORIG_KC_LIST=$(security list-keychains -d user | xargs)
+
+# Cleanup function to restore keychain list on exit
+cleanup() {
+    echo "[*] Cleaning up keychain..."
+    security list-keychains -d user -s $ORIG_KC_LIST
+    security delete-keychain "$KC_NAME" || true
+}
+trap cleanup EXIT
+
+echo "[*] Preparing Signing Identity..."
+security create-keychain -p "$KC_PASS" "$KC_NAME"
+security unlock-keychain -p "$KC_PASS" "$KC_NAME"
+
+# Add temp keychain to search list
+security list-keychains -d user -s "$KC_NAME" $ORIG_KC_LIST
+
+# 3. Handle Certificate (Legacy Fix)
+openssl pkcs12 -in "$P12_FILE" -out build/temp.pem -nodes -passin pass:"$P12_PASS"
+openssl pkcs12 -export -in build/temp.pem -out build/legacy.p12 -passout pass:"$P12_PASS" -legacy
+rm build/temp.pem
+
+security import build/legacy.p12 -k "$KC_NAME" -P "$P12_PASS" -T /usr/bin/codesign
+rm build/legacy.p12
+
+# 4. Sign the dylib
+echo "[*] Signing dylib..."
+IDENTITY=$(security find-identity -v -p codesigning "$KC_NAME" | head -n 1 | awk -F '"' '{print $2}')
+
+if [ -z "$IDENTITY" ]; then
+    echo "Error: Identity not found in keychain."
+    exit 1
+fi
+
+codesign --force --sign "$IDENTITY" --timestamp=none build/$FILENAME.dylib
+
+# 5. Verify
+echo "[*] Signature Verification:"
+codesign -dvvv build/$FILENAME.dylib 2>&1 | grep "Authority"
+
+# 6. Start Deployment
+echo "[*] Starting Log Listener (TCP 8889) in background..."
+#nc -l 8889 &
+
+echo "[!] Ready! Launch the app on iPhone now."
+echo "[*] Sending dylib to iPhone on TCP 8887..."
+#cat build/$FILENAME.dylib | nc -l 8887
+python3 bridge.py build/$FILENAME.dylib
+
+echo "[*] Done. Streaming logs below:"
+wait
