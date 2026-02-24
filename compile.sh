@@ -1,12 +1,51 @@
 #!/bin/bash
 
-if [ ! -f "$1.m" ]; then
-	echo "$1.m does not exist"
+FILE=$1
+shift
+EXTRA_FLAGS=$@
+OUTPUT_DIR=${OUTPUT_DIR:-"./build"}
+OUTPUT_PATH=${OUTPUT_PATH:-""}
+CLANG_INCLUDES=${CLANG_INCLUDES:-"fishhook"}
+CLANG_SOURCES=${CLANG_SOURCES:-"fishhook/fishhook.c"}
+CLANG_FRAMEWORKS=${CLANG_FRAMEWORKS:-"CoreAudio AVFoundation CoreMedia CoreVideo AudioToolbox UIKit Foundation"}
+CLANG_INCLUDES="$CLANG_INCLUDES $CLANG_EXTRA_INCLUDES"
+CLANG_SOURCES="$CLANG_SOURCES $CLANG_EXTRA_SOURCES"
+CLANG_FRAMEWORKS="$CLANG_FRAMEWORKS $CLANG_EXTRA_FRAMEWORKS"
+
+FILE="${FILE%.*}"
+NAME=$(basename "$FILE")
+
+set -e
+SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path)
+
+if [ -z "$FILE" ]; then
+	echo "Usage: $0 <FILE>"
 	exit 1
 fi
 
-set -e
+if [ ! -f "$FILE.m" ]; then
+	echo "Error: $FILE.m not found"
+	exit 1
+fi
 
-mkdir -p build 
+if [ -z "$OUTPUT_PATH" ]; then
+	OUTPUT_PATH="$OUTPUT_DIR/$NAME.dylib"
+fi
 
-clang -dynamiclib -arch arm64 -isysroot $(xcrun --sdk iphoneos --show-sdk-path) -I fishhook  -framework CoreAudio -framework AVFoundation -framework CoreMedia -framework CoreVideo -framework AudioToolbox -framework UIKit -framework Foundation -o build/$1.dylib $1.m fishhook/fishhook.c
+FLAGS="-dynamiclib -arch arm64 -isysroot $SDK_PATH"
+for INCLUDE in $CLANG_INCLUDES; do
+	FLAGS="$FLAGS -I $INCLUDE"
+done
+
+for FRAMEWORK in $CLANG_FRAMEWORKS; do
+	FLAGS="$FLAGS -framework $FRAMEWORK"
+done
+
+FLAGS="$FLAGS $EXTRA_FLAGS"
+FLAGS="$FLAGS -o $OUTPUT_PATH"
+FLAGS="$FLAGS $FILE.m $CLANG_SOURCES"
+
+mkdir -p $OUTPUT_DIR
+
+echo clang $FLAGS
+clang $FLAGS
