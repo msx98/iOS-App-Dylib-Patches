@@ -1,0 +1,16 @@
+// clang -dynamiclib -arch arm64 -isysroot $(xcrun --sdk iphoneos --show-sdk-path) -I fishhook  -framework CoreAudio -framework AVFoundation -framework CoreMedia -framework CoreVideo -framework AudioToolbox -framework UIKit -framework Foundation -o build/$1.dylib $1.m fishhook/fishhook.c
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "build dylib",
+            "type": "shell",
+            "command": "clang -dynamiclib -arch arm64 -isysroot $(xcrun --sdk iphoneos --show-sdk-path) -I fishhook  -framework CoreAudio -framework AVFoundation -framework CoreMedia -framework CoreVideo -framework AudioToolbox -framework UIKit -framework Foundation -o build/${fileBasenameNoExtension}.dylib ${file} fishhook/fishhook.c",
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            },
+            "problemMatcher": []
+        }
+    ]
+}

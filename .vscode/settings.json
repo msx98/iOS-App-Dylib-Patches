@@ -1,0 +1,13 @@
+{
+    "explorer.excludeGitIgnore": true,
+    // c include paths
+    "C_Cpp.default.includePath": [
+        "/usr/include/**",
+        "/usr/local/include/**",
+        "${workspaceFolder}/fishhook",
+    ],
+    "clang.objcflags": [
+        "-I${workspaceFolder}/LiveContainer",
+        "-I${workspaceFolder}/fishhook",
+    ]
+}

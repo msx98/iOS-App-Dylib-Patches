@@ -1,0 +1,16 @@
+{
+    "configurations": [
+        {
+            "name": "Build Dynamic Library ('build dylib' task)",
+            "request": "launch",
+            "preLaunchTask": "build dylib",
+            "program": "${workspaceFolder}/build/${fileBasenameNoExtension}.dylib",
+            "args": [],
+            "stopAtEntry": false,
+            "cwd": "${workspaceFolder}",
+            "environment": [],
+            "externalConsole": false,
+            "MIMode": "lldb"
+        }
+    ]
+}
