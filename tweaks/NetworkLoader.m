@@ -385,23 +385,16 @@ static void init() {
     }
     objs[i] = h;
     debug_print(@"Loaded %s successfully.", path);
-    // load onInit_ from the dylib if it exists
-    void *mainFunc = dlsym(h, "onInit_");
-    if (mainFunc) {
-      debug_print(@"Found onInit_ in %s, calling it…", path);
-      ((void (*)(NetworkLogger))mainFunc)(logger);
-    } else {
-      debug_print(@"No onInit_ found in %s, skipping.", path);
-    }
   }
   debug_print(@"Finished loading");
-  /*    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH,
+  dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH,
      0), ^{ debug_print(@"Finished loading - now im gonna wait");
           char monitor[1];
-          while (recv(sock, monitor, 1, 0) > 0) { }
-          debug_print(@"[*] Connection lost. Killing app.");
-          exit(0);
-      });*/
+          if (recv(sock, monitor, 1, 0) > 0) {
+            debug_print(@"Received kill ping");
+            abort();
+          }
+      });
 }
 
 
