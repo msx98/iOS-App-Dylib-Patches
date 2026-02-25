@@ -14,7 +14,7 @@ tweaks/         Tweak source files (.m) organized by app
 lib/
   fishhook/     Facebook's PLT hooking library (submodule)
   LiveContainer/ LiveContainer framework headers (submodule)
-  utils/        Shared headers: utils.h, foundation.h, logger.m
+  utils/        Shared headers: utils.m, foundation.m, logger.m
 scripts/
   compile.sh                     Main compiler script
   compile_network_dylib_loader.sh Compile NetworkLoader/DylibLoaderNew
@@ -71,7 +71,7 @@ This compiles, signs with the SideStore certificate in the local keychain, then 
 - **Function hooking**: Use `fishhook` (`rebind_symbols`) for C/system functions (e.g. `AudioUnitRender`, `openURL`)
 - **Method swizzling**: Use Objective-C runtime (`method_exchangeImplementations`) for ObjC methods
 - **Dynamic symbol resolution**: Use `dlsym()` + `dlopen()` to call LiveContainer symbols at runtime without linking
-- **Shared utilities**: Include `lib/utils/utils.m` to get `foundation.h` and `logger.m` network logging
+- **Shared utilities**: Include `lib/utils/utils.m` to get `foundation.m` and `logger.m` network logging
 
 ## Certificates and Signing (gitignored)
 

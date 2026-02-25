@@ -11,7 +11,7 @@
 
 #define CONCAT_MACRO(A, B) A##B
 
-#include "foundation.h"
+#include "foundation.m"
 #include "logger.m"
 
 #endif
