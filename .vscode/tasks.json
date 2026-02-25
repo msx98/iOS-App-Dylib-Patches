@@ -5,9 +5,9 @@
         {
             "label": "build dylib",
             "type": "shell",
-            "command": "./compile.sh",
+            "command": "./scripts/compile",
             "args": [
-                "${fileBasenameNoExtension}"
+                "${relativeFileDirname}/${fileBasename}"
             ],
             "group": {
                 "kind": "build",

@@ -1,16 +1,14 @@
 {
     "configurations": [
         {
-            "name": "Build Dynamic Library ('build dylib' task)",
+            "name": "Build Dylib",
+            "type": "cppdbg",
             "request": "launch",
+            "stopAtEntry": true,
+            "program": "/usr/bin/true",
             "preLaunchTask": "build dylib",
-            "program": "${workspaceFolder}/build/${fileBasenameNoExtension}.dylib",
-            "args": [],
-            "stopAtEntry": false,
-            "cwd": "${workspaceFolder}",
-            "environment": [],
-            "externalConsole": false,
-            "MIMode": "lldb"
+            "MIMode": "lldb",
+            "cwd": "${workspaceFolder}"
         }
     ]
 }
