@@ -6,7 +6,7 @@ REPO_ROOT="${SCRIPT_DIR}/.."
 FILENAME=$1
 NAME=$(basename "$FILENAME")
 IP_MAC="192.168.1.23"
-P12_FILE="$REPO_ROOT/.keys/SideStoreSigningCertificate.p12"
+P12_FILE="$REPO_ROOT/.secrets/SideStoreSigningCertificate.p12"
 P12_PASS="abc"
 
 if [ ! -f "$REPO_ROOT/$FILENAME.m" ]; then
