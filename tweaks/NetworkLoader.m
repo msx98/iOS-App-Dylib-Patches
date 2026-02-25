@@ -169,8 +169,8 @@ static BOOL signReceivedTweaks(NSString *tweakDir,
 
   // Copy each dylib into the .app
   NSMutableArray<NSString *> *tmpPaths = [NSMutableArray array];
-  for (NSString *name in fileNames) {
-    NSString *src = [tweakDir stringByAppendingPathComponent:name];
+  for (NSString *src in fileNames) {
+    NSString *name = [src lastPathComponent];
     NSString *dst = [tmpAppDir stringByAppendingPathComponent:name];
     NSError *copyErr = nil;
     [fm copyItemAtPath:src toPath:dst error:&copyErr];
@@ -230,9 +230,10 @@ static BOOL signReceivedTweaks(NSString *tweakDir,
   }
 
   // Move signed dylibs back, overwriting originals
-  for (NSString *tmpPath in tmpPaths) {
+  for (int i=0; i < tmpPaths.count; i++) {
+    NSString *tmpPath = tmpPaths[i];
     NSString *name = [tmpPath lastPathComponent];
-    NSString *dstPath = [tweakDir stringByAppendingPathComponent:name];
+    NSString *dstPath = fileNames[i];
 
     // Log sizes before move
     NSDictionary *srcAttrs = [fm attributesOfItemAtPath:tmpPath error:nil];
@@ -311,9 +312,7 @@ static void init() {
   dylib_count = ntohl(dylib_count);
   debug_print(@"Count 2: %d", dylib_count);
 
-  NSString *basePath = [@"/private/var/mobile/Containers/Data/Application/"
-                        @"EF9EB8C3-C3CA-4E39-92A6-A005FD1292EB/"
-      stringByAppendingPathComponent:@"Documents/Tweaks/LiveTweaks"];
+  NSString *basePath = [getActualContainerPath() stringByAppendingPathComponent:@"Documents/Tweaks/LiveTweaks"];
   [[NSFileManager defaultManager] createDirectoryAtPath:basePath
                             withIntermediateDirectories:YES
                                              attributes:nil
@@ -321,6 +320,18 @@ static void init() {
   void **objs = malloc(sizeof(void *) * dylib_count);
   NSMutableArray<NSString *> *receivedNames =
       [NSMutableArray arrayWithCapacity:dylib_count];
+    NSMutableArray<NSString *> *receivedPaths =
+      [NSMutableArray arrayWithCapacity:dylib_count];
+    
+  NSString *nonLoaderPath = [basePath stringByAppendingPathComponent:@"Load"];
+  if ([[NSFileManager defaultManager] fileExistsAtPath:nonLoaderPath]) {
+    debug_print(@"Cleaning up existing Load directory at path: %@", nonLoaderPath);
+    [[NSFileManager defaultManager] removeItemAtPath:nonLoaderPath error:nil];
+  }
+  [[NSFileManager defaultManager] createDirectoryAtPath:nonLoaderPath
+                                withIntermediateDirectories:YES
+                                                 attributes:nil
+                                                      error:nil];
 
   // ── Phase 1: Receive all dylibs to disk ──
   for (int i = 0; i < dylib_count; i++) {
@@ -337,9 +348,16 @@ static void init() {
     data_len = ntohl(data_len);
 
     NSString *fileName = [NSString stringWithUTF8String:name_buf];
-    NSString *fullPath = [basePath stringByAppendingPathComponent:fileName];
+    NSString *fullPath = nil;
+    if (![fileName isEqualToString:@"NetworkLoader.dylib"]) {
+      fullPath = [[basePath stringByAppendingPathComponent:@"Load"] stringByAppendingPathComponent:fileName];
+    } else {
+      fullPath = [basePath stringByAppendingPathComponent:fileName];
+    }
+    [receivedPaths addObject:fullPath];
     const char *path = [fullPath UTF8String];
-    debug_print(@"#%d needs to recv %d into %s", i, data_len, path);
+    
+    debug_print(@"#%d needs to recva %d into %s", i, data_len, path);
 
     // Clean start
     unlink(path);
@@ -361,7 +379,7 @@ static void init() {
   // ── Phase 2: Sign all received tweaks via LiveContainer's ZSign ──
   debug_print(@"Signing %lu received tweaks…",
               (unsigned long)receivedNames.count);
-  if (!signReceivedTweaks(basePath, receivedNames)) {
+  if (!signReceivedTweaks(basePath, receivedPaths)) {
     debug_print(@"WARNING: Signing failed — dlopen may fail on "
                 @"JIT-less setups.");
   } else {
@@ -373,9 +391,12 @@ static void init() {
 
   // ── Phase 3: dlopen every signed dylib ──
   for (int i = 0; i < dylib_count; i++) {
-    debug_print(@"%d: Loading tweak %@…", i, receivedNames[i]);
-    NSString *fullPath =
-        [basePath stringByAppendingPathComponent:receivedNames[i]];
+    if ([receivedNames[i] isEqualToString:@"NetworkLoader.dylib"]) {
+      debug_print(@"Skipping reloading myself");
+      continue;
+    }
+    debug_print(@"%d: Loading tweaka %@…", i, receivedNames[i]);
+    NSString *fullPath = receivedPaths[i];
     const char *path = [fullPath UTF8String];
     debug_print(@"Loading %s…", path);
     void *h = dlopen(path, RTLD_NOW | RTLD_GLOBAL);

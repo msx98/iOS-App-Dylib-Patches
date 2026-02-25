@@ -4,6 +4,8 @@
 #import <objc/runtime.h>
 #import <UIKit/UIKit.h>
 
+#include "../../lib/utils/utils.m"
+
 // Define our dummy class
 @interface MyDummyVocabulary : NSObject
 @end
@@ -35,8 +37,7 @@
 
 
 
-__attribute__((constructor))
-static void initPatch() {
+static void init() {
     Class originalClass = objc_getClass("INVocabulary");
     if (originalClass) {
         id (^swizzleBlock)(id) = ^id(id self) {
@@ -55,3 +56,5 @@ static void initPatch() {
     }
 
 }
+
+INITIALIZE("WhatsAppDisableSiriEntitlement")

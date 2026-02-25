@@ -11,6 +11,10 @@
 
 #define CONCAT_MACRO(A, B) A##B
 
+NSString *getActualContainerPath() {
+    return [[[[NSHomeDirectory() stringByDeletingLastPathComponent] stringByDeletingLastPathComponent] stringByDeletingLastPathComponent] stringByDeletingLastPathComponent];
+}
+
 #include "foundation.m"
 #include "logger.m"
 
