@@ -29,3 +29,7 @@ with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         # Wait for the final status (LOAD SUCCESS or ERROR)
         final_status = conn.recv(1024).decode(errors='ignore')
         print(f"iPhone Result: {final_status.strip()}")
+    conn, addr = s.accept()
+    with conn:
+        while True:
+            nb = conn.recv(8); b = conn.recv(nb); print(b.decode("UTF-8"))

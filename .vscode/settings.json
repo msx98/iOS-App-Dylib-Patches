@@ -11,5 +11,11 @@
         "-I${workspaceFolder}/LiveContainer",
         "-I${workspaceFolder}/fishhook",
         "-I${workspaceFolder}/utils",
-    ]
+    ],
+    "C_Cpp.default.systemIncludePath": [
+        "${workspaceFolder}/utils",
+    ],
+    "files.associations": {
+        "*.m": "objective-c"
+    },
 }

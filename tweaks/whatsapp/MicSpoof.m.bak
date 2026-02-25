@@ -1,0 +1,78 @@
+#import <Foundation/Foundation.h>
+#import <AudioToolbox/AudioToolbox.h>
+#import <math.h>
+#import "fishhook.h"
+
+static OSStatus (*orig_AudioUnitRender)(AudioUnit, AudioUnitRenderActionFlags *, const AudioTimeStamp *, UInt32, UInt32, AudioBufferList *);
+static OSStatus (*orig_AudioUnitSetProperty)(AudioUnit, AudioUnitPropertyID, AudioUnitScope, AudioUnitElement, const void *, UInt32);
+
+static FILE *g_fileIn = NULL;
+static FILE *g_fileOut = NULL;
+static double g_phase = 0.0;
+static AURenderCallback orig_renderCallback = NULL;
+
+// The "Interceptor" Callback for both Input and Output
+OSStatus hooked_renderCallback(void *inRefCon, AudioUnitRenderActionFlags *ioActionFlags, const AudioTimeStamp *inTimeStamp, UInt32 inBusNumber, UInt32 inNumberFrames, AudioBufferList *ioData) {
+    
+    // 1. Let the app's original logic fill the buffer (for output) or acknowledge it (for input)
+    OSStatus status = noErr;
+    if (orig_renderCallback) {
+        status = orig_renderCallback(inRefCon, ioActionFlags, inTimeStamp, inBusNumber, inNumberFrames, ioData);
+    }
+
+    if (status == noErr && ioData != NULL && g_fileOut) {
+        for (int i=0; i < ioData->mNumberBuffers; i++) {
+            // This captures the "Speaker" data that the app just provided
+            fwrite(ioData->mBuffers[i].mData, 1, ioData->mBuffers[i].mDataByteSize, g_fileOut);
+        }
+    }
+    return status;
+}
+
+// Hook SetProperty to catch when the app assigns its callbacks
+OSStatus hooked_AudioUnitSetProperty(AudioUnit inUnit, AudioUnitPropertyID inID, AudioUnitScope inScope, AudioUnitElement inElement, const void *inData, UInt32 inDataSize) {
+    
+    // 23 = SetRenderCallback (Speaker/Pull)
+    // 2005 = SetInputCallback (Mic/Push)
+    if (inID == kAudioUnitProperty_SetRenderCallback || inID == 2005) {
+        if (inDataSize >= sizeof(AURenderCallbackStruct)) {
+            AURenderCallbackStruct *cb = (AURenderCallbackStruct *)inData;
+            if (cb->inputProc != NULL && cb->inputProc != hooked_renderCallback) {
+                orig_renderCallback = cb->inputProc;
+                cb->inputProc = hooked_renderCallback;
+                NSLog(@"[MicSpoof] Intercepted callback for Property ID: %u", inID);
+            }
+        }
+    }
+    return orig_AudioUnitSetProperty(inUnit, inID, inScope, inElement, inData, inDataSize);
+}
+
+// Hook Render for the Mic Spoofing
+OSStatus hooked_AudioUnitRender(AudioUnit inUnit, AudioUnitRenderActionFlags *ioActionFlags, const AudioTimeStamp *inTimeStamp, UInt32 inBusNumber, UInt32 inNumberFrames, AudioBufferList *ioData) {
+    OSStatus status = orig_AudioUnitRender(inUnit, ioActionFlags, inTimeStamp, inBusNumber, inNumberFrames, ioData);
+    
+    if (status == noErr && ioData != NULL && inBusNumber == 1) {
+        if (g_fileIn) fwrite(ioData->mBuffers[0].mData, 1, ioData->mBuffers[0].mDataByteSize, g_fileIn);
+        
+        // --- SINE WAVE SPOOF ---
+        float *buf = (float *)ioData->mBuffers[0].mData;
+        for (UInt32 f = 0; f < ioData->mBuffers[0].mDataByteSize/4; f++) {
+            buf[f] = (float)sin(g_phase);
+            g_phase += 0.0628; 
+            if (g_phase > 6.28) g_phase -= 6.28;
+        }
+    }
+    return status;
+}
+
+__attribute__((constructor))
+static void init() {
+    NSString *doc = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents"];
+    g_fileIn = fopen([[doc stringByAppendingPathComponent:@"mic_in.bin"] UTF8String], "wb");
+    g_fileOut = fopen([[doc stringByAppendingPathComponent:@"app_out.bin"] UTF8String], "wb");
+
+    rebind_symbols((struct rebinding[]){
+        {"AudioUnitRender", hooked_AudioUnitRender, (void *)&orig_AudioUnitRender},
+        {"AudioUnitSetProperty", hooked_AudioUnitSetProperty, (void *)&orig_AudioUnitSetProperty}
+    }, 2);
+}

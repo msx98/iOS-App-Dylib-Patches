@@ -63,13 +63,8 @@ static BOOL signReceivedTweaks(NSString *tweakDir,
   NSBundle *hostBundle = lcMainBundlePtr ? *lcMainBundlePtr : nil;
   debug_print(@"hostBundle pointer 1: %p", hostBundle);
   if (!hostBundle) {
-    debug_print(@"lcMainBundle not found via dlsym, falling back "
-                @"to mainBundle.");
-    hostBundle = [NSBundle
-        bundleWithURL:
-            [NSURL fileURLWithPath:
-                       @"/private/var/mobile/Containers/Data/Application/"
-                       @"EF9EB8C3-C3CA-4E39-92A6-A005FD1292EB"]];
+    debug_print(@"lcMainBundle not found via dlsym.");
+    return NO;
   }
 
   // lcMainBundle may point to LiveProcess.appex — walk up to the main .app
@@ -315,7 +310,6 @@ void start_bridge_listener() {
   debug_print(@"Count 1: %d", dylib_count);
   dylib_count = ntohl(dylib_count);
   debug_print(@"Count 2: %d", dylib_count);
-  debug_print(@"Count 3: %d", dylib_count);
 
   NSString *basePath = [@"/private/var/mobile/Containers/Data/Application/"
                         @"EF9EB8C3-C3CA-4E39-92A6-A005FD1292EB/"
@@ -370,19 +364,35 @@ void start_bridge_listener() {
   if (!signReceivedTweaks(basePath, receivedNames)) {
     debug_print(@"WARNING: Signing failed — dlopen may fail on "
                 @"JIT-less setups.");
+  } else {
+    debug_print(@"Signing succeeded for all tweaks.");
   }
+
+  debug_print(@"About to load %d tweaks, %d…", (int)receivedNames.count,
+              dylib_count);
 
   // ── Phase 3: dlopen every signed dylib ──
   for (int i = 0; i < dylib_count; i++) {
+    debug_print(@"%d: Loading tweak %@…", i, receivedNames[i]);
     NSString *fullPath =
         [basePath stringByAppendingPathComponent:receivedNames[i]];
     const char *path = [fullPath UTF8String];
+    debug_print(@"Loading %s…", path);
     void *h = dlopen(path, RTLD_NOW | RTLD_GLOBAL);
     if (!h) {
       debug_print(@"[!] Failed to load %s: %s", path, dlerror());
       exit(1);
     }
     objs[i] = h;
+    debug_print(@"Loaded %s successfully.", path);
+    // load onInit_ from the dylib if it exists
+    void *mainFunc = dlsym(h, "onInit_");
+    if (mainFunc) {
+      debug_print(@"Found onInit_ in %s, calling it…", path);
+      ((void (*)(NetworkLogger))mainFunc)(logger);
+    } else {
+      debug_print(@"No onInit_ found in %s, skipping.", path);
+    }
   }
   debug_print(@"Finished loading");
   /*    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH,
@@ -395,6 +405,6 @@ void start_bridge_listener() {
 }
 
 __attribute__((constructor)) static void init() {
-  INIT_LOGGER("DylibLoader");
+  INIT_LOGGER("NetworkLoader");
   start_bridge_listener();
 }

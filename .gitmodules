@@ -1,6 +1,6 @@
 [submodule "fishhook"]
-	path = fishhook
+	path = lib/fishhook
 	url = https://github.com/facebook/fishhook.git
 [submodule "LiveContainer"]
-	path = LiveContainer
+	path = lib/LiveContainer
 	url = git@github.com:LiveContainer/LiveContainer.git

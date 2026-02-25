@@ -1,12 +1,14 @@
 #!/bin/bash
 
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+
 FILE=$1
 shift
 EXTRA_FLAGS=$@
-OUTPUT_DIR=${OUTPUT_DIR:-"./build"}
+OUTPUT_DIR=${OUTPUT_DIR:-"$REPO_ROOT/build"}
 OUTPUT_PATH=${OUTPUT_PATH:-""}
-CLANG_INCLUDES=${CLANG_INCLUDES:-"fishhook utils"}
-CLANG_SOURCES=${CLANG_SOURCES:-"fishhook/fishhook.c utils/utils.m"}
+CLANG_INCLUDES=${CLANG_INCLUDES:-"$REPO_ROOT/lib/fishhook $REPO_ROOT/lib/utils"}
+CLANG_SOURCES=${CLANG_SOURCES:-"$REPO_ROOT/lib/fishhook/fishhook.c $REPO_ROOT/lib/utils/utils.m"}
 CLANG_FRAMEWORKS=${CLANG_FRAMEWORKS:-"CoreAudio AVFoundation CoreMedia CoreVideo AudioToolbox UIKit Foundation"}
 CLANG_INCLUDES="$CLANG_INCLUDES $CLANG_EXTRA_INCLUDES"
 CLANG_SOURCES="$CLANG_SOURCES $CLANG_EXTRA_SOURCES"
