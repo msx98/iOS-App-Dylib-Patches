@@ -9,7 +9,7 @@
 #import <objc/message.h>
 #import <objc/runtime.h>
 
-#import "utils/logger2.m"
+#import "utils/logger.m"
 
 // ── All LiveContainer symbols resolved purely at runtime ──
 // No linker references — uses NSClassFromString / dlsym / objc_msgSend.
