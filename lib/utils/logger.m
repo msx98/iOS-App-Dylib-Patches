@@ -41,6 +41,7 @@ static inline void network_logger_print(NetworkLogger *l, NSString *message) {
   NSData *data = [[NSString stringWithFormat:@"[%s] %@\n", l->name, message]
       dataUsingEncoding:NSUTF8StringEncoding];
   // Local log
+  NSLog(@"[NSLog] [%s] %@", l->name, message);
   os_log(OS_LOG_DEFAULT, "%@", message);
 
   // UDP send (async)

@@ -3,19 +3,23 @@
     "C_Cpp.default.includePath": [
         "/usr/include/**",
         "/usr/local/include/**",
-        "./lib/LiveContainer",
-        "./lib/fishhook",
-        "./lib/utils",
+        "${workspaceFolder}/lib",
+        "${workspaceFolder}/lib/LiveContainer",
+        "${workspaceFolder}/lib/fishhook",
+        "${workspaceFolder}/lib/utils",
     ],
     "clang.objcflags": [
-        "-I./lib/LiveContainer",
-        "-I$./lib/fishhook",
-        "-I$./lib/utils",
+        "-I${workspaceFolder}/lib",
+        "-I${workspaceFolder}/lib/LiveContainer",
+        "-I${workspaceFolder}/lib/fishhook",
+        "-I${workspaceFolder}/lib/utils",
     ],
     "C_Cpp.default.systemIncludePath": [
-        "lib/utils",
-        "lib/fishhook",
-        "lib/LiveContainer",
+        "${workspaceFolder}/lib",
+        "${workspaceFolder}/lib/utils",
+        "${workspaceFolder}/lib/fishhook",
+        "${workspaceFolder}/lib/LiveContainer",
+        "lib",
     ],
     "files.associations": {
         "*.m": "objective-c"

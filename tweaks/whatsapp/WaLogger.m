@@ -1,8 +1,7 @@
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
 
-#import "utils/utils.m"
-INITIALIZE("WaLogger");
+#import "../../lib/utils/utils.m"
 
 static void write_to_log_file(NSString *message) {
   static NSFileHandle *fileHandle = nil;
@@ -58,9 +57,7 @@ static void swizzle_any(Class cls, SEL originalSelector, SEL swizzledSelector) {
 
 @end
 
-void onLoad() { debug_print(@"WaLogger loaded."); }
-
-void onInit() {
+static void init() {
   // 1. Hook NSObject init to find the exact subclass name used during a call
   swizzle_any([NSObject class], @selector(init), @selector(discovery_init));
 
@@ -79,3 +76,5 @@ void onInit() {
     }
   }
 }
+
+INITIALIZE("WaLogger")

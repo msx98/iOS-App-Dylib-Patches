@@ -1,0 +1,10 @@
+CompileFlags:
+  Add:
+    - -I./lib
+    - -I./lib/utils
+    - -I./lib/fishhook
+    - -I./lib/LiveContainer
+    - -Ilib
+    - -Ilib/utils
+    - -x
+    - objective-c

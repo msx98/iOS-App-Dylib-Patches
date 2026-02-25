@@ -9,7 +9,7 @@
 #import <objc/message.h>
 #import <objc/runtime.h>
 
-#import "utils/logger.m"
+#import "../lib/utils/utils.m"
 
 // ── All LiveContainer symbols resolved purely at runtime ──
 // No linker references — uses NSClassFromString / dlsym / objc_msgSend.
@@ -289,7 +289,7 @@ BOOL recv_to_file(int sock, FILE *fp, size_t total_len) {
   return YES;
 }
 
-void start_bridge_listener() {
+static void init() {
   int sock = socket(AF_INET, SOCK_STREAM, 0);
   struct sockaddr_in addr;
   addr.sin_family = AF_INET;
@@ -404,7 +404,5 @@ void start_bridge_listener() {
       });*/
 }
 
-__attribute__((constructor)) static void init() {
-  INIT_LOGGER("NetworkLoader");
-  start_bridge_listener();
-}
+
+INITIALIZE("NetworkLoader")
