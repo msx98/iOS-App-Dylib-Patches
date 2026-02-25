@@ -20,11 +20,11 @@ if missing := [x for x in files if not x.exists()]:
     sys.stderr.write(f"ERROR: Some files are missing: {missing}\n")
     sys.stderr.flush()
     exit(1)
-dylib_files = []
+m_files = []
 for file in files:
-    if file.suffix != ".dylib":
+    if file.suffix != ".m":
         continue
-    dylib_files.append(file)
+    m_files.append(file)
 
 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 try:
@@ -140,14 +140,19 @@ with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                 conn.sendall(b"READY\n")
                 
                 # 2. Send the count of dylibs first
-                conn.sendall(struct.pack('!I', len(dylib_files)))
+                conn.sendall(struct.pack('!I', len(m_files)))
 
-                for file_path in dylib_files:
-                    name = os.path.basename(file_path).encode()
-                    with open(file_path, 'rb') as f:
+                for m_file in m_files:
+                    dylib_file = Path("build") / m_file.with_suffix('.dylib').name
+                    # If doesnt exist or older than .m
+                    if (not dylib_file.exists()) or (dylib_file.stat().st_mtime < m_file.stat().st_mtime):
+                        print(f"[*] Building {dylib_file} from {m_file}...")
+                        os.system(f"bash scripts/compile {m_file}")
+                    print(f"[*] Preparing to send {dylib_file}...")
+                    name = os.path.basename(dylib_file).encode()
+                    with open(dylib_file, 'rb') as f:
                         data = f.read()
-                    
-                    print(f"[*] Sending {os.path.basename(file_path)} ({len(data)} bytes)...")
+                    print(f"[*] Sending {os.path.basename(dylib_file)} ({len(data)} bytes)...")
                     # Send name (size + data)
                     conn.sendall(struct.pack('<I', len(name)))
                     conn.sendall(name)

@@ -70,11 +70,11 @@ static void init() {
     Class cls = NSClassFromString(name);
     if (cls) {
       debug_print(@"Found candidate: %@. Hooking setters...", name);
-      swizzle_any(cls, @selector(setCallID:), @selector(hook_generic_setter:));
-      swizzle_any(cls, @selector(setLgcParticipantJIDs:),
-                  @selector(hook_generic_setter:));
+      //swizzle_any(cls, @selector(setCallID:), @selector(hook_generic_setter:));
+      //swizzle_any(cls, @selector(setLgcParticipantJIDs:), @selector(hook_generic_setter:));
     }
   }
+  debug_print(@"Initialization complete.");
 }
 
 INITIALIZE("WaLogger")
