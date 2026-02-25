@@ -1,4 +1,5 @@
 build
+.keys
 *.p12
 *.mobileprovision
 *.xcarchive

@@ -8,7 +8,8 @@
 # the linker defer resolution.
 #
 
-REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" &> /dev/null && pwd -P)
+REPO_ROOT="${SCRIPT_DIR}/.."
 
 set -e
 

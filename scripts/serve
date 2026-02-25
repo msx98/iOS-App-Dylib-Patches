@@ -1,11 +1,12 @@
 #!/bin/bash
 
 # Usage: ./scripts/serve tweaks/whatsapp/MicSpoof
-REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" &> /dev/null && pwd -P)
+REPO_ROOT="${SCRIPT_DIR}/.."
 FILENAME=$1
 NAME=$(basename "$FILENAME")
 IP_MAC="192.168.1.23"
-P12_FILE="$REPO_ROOT/SideStoreSigningCertificate.p12"
+P12_FILE="$REPO_ROOT/.keys/SideStoreSigningCertificate.p12"
 P12_PASS="abc"
 
 if [ ! -f "$REPO_ROOT/$FILENAME.m" ]; then
