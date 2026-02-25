@@ -6,6 +6,7 @@ import select
 import sys
 import os
 import glob
+import hashlib
 from collections import defaultdict
 from io import BytesIO
 from threading import Thread, Lock, Event
@@ -114,10 +115,14 @@ class LogThread:
 
 
 
-def send_data(conn, data):
-    # Pack size as a 4-byte unsigned integer (Little Endian)
-    conn.sendall(struct.pack('!I', len(data)))
-    conn.sendall(data)
+def recv_exact(conn, n):
+    buf = b''
+    while len(buf) < n:
+        chunk = conn.recv(n - len(buf))
+        if not chunk:
+            raise ConnectionError("Connection closed")
+        buf += chunk
+    return buf
 
 
 with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -135,16 +140,13 @@ with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             conn, addr = s.accept()
             conns.append(conn)
             print(f"[*] Connected by {addr}")
-            conn.sendall(b"READY\n")
-            
-            # 2. Send the count of dylibs first
-            conn.sendall(struct.pack('!I', len(load_files)))
 
+            # Build all dylibs and compute their hashes upfront
+            file_infos = []  # list of (name_bytes, sha256_bytes, data_bytes)
             for file in load_files:
                 if file.suffix in [".m", ".mm"]:
                     dylib_file = Path("build") / file.with_suffix('.dylib').name
                     m_file = Path(file.resolve())
-                    # If doesnt exist or older than .m
                     if (not dylib_file.exists()) or (dylib_file.stat().st_mtime < m_file.stat().st_mtime):
                         print(f"[*] Building {dylib_file} from {m_file}...")
                         os.system(f"bash scripts/compile {m_file}")
@@ -152,19 +154,37 @@ with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                     dylib_file = file
                 else:
                     continue
-                print(f"[*] Preparing to send {dylib_file}...")
-                name = os.path.basename(dylib_file).encode()
                 with open(dylib_file, 'rb') as f:
                     data = f.read()
-                print(f"[*] Sending {os.path.basename(dylib_file)} ({len(data)} bytes)...")
-                # Send name (size + data)
+                name = os.path.basename(dylib_file).encode()
+                sha256 = hashlib.sha256(data).digest()
+                file_infos.append((name, sha256, data))
+                print(f"[*] {dylib_file.name}: {len(data)} bytes, sha256={sha256.hex()[:16]}…")
+
+            # Send READY + manifest (count, then name+sha256 per file)
+            conn.sendall(b"READY\n")
+            conn.sendall(struct.pack('!I', len(file_infos)))
+            for name, sha256, _ in file_infos:
                 conn.sendall(struct.pack('<I', len(name)))
                 conn.sendall(name)
+                conn.sendall(sha256)  # 32 bytes
+
+            # Receive list of indices the iPhone still needs
+            needed_count = struct.unpack('!I', recv_exact(conn, 4))[0]
+            needed_indices = [struct.unpack('!I', recv_exact(conn, 4))[0] for _ in range(needed_count)]
+            skipped = len(file_infos) - needed_count
+            print(f"[*] iPhone needs {needed_count}/{len(file_infos)} files ({skipped} up-to-date)")
+            if needed_indices:
+                print(f"[*] Sending: {[file_infos[i][0].decode() for i in needed_indices]}")
+
+            # Send only the requested files
+            for idx in needed_indices:
+                name, _, data = file_infos[idx]
+                print(f"[*] Sending {name.decode()} ({len(data)} bytes)...")
                 conn.sendall(struct.pack('!I', len(data)))
-                # Send file (size + data)
                 conn.sendall(data)
 
-            print("[*] All dylibs sent. Keeping connection alive until you Ctrl+C.")
+            print("[*] All done. Keeping connection alive until you Ctrl+C.")
     except KeyboardInterrupt:
         print("[*] KeyboardInterrupt received, shutting down...")
         for conn in conns:

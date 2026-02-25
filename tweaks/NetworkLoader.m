@@ -22,36 +22,7 @@
 //   4. Move signed dylibs back, clean up
 
 
-#import <CommonCrypto/CommonDigest.h>
-
-static NSString *sha256ForFile(NSString *path) {
-    FILE *fp = fopen(path.UTF8String, "rb");
-    if (!fp) return nil;
-
-    unsigned char hash[CC_SHA256_DIGEST_LENGTH];
-    CC_SHA256_CTX sha256;
-    CC_SHA256_Init(&sha256);
-
-    const int bufSize = 32768;
-    unsigned char *buffer = malloc(bufSize);
-    size_t bytesRead = 0;
-    while ((bytesRead = fread(buffer, 1, bufSize, fp)) > 0) {
-        CC_SHA256_Update(&sha256, buffer, (CC_LONG)bytesRead);
-    }
-    free(buffer);
-    fclose(fp);
-
-    CC_SHA256_Final(hash, &sha256);
-    NSMutableString *hashString = [NSMutableString stringWithCapacity:CC_SHA256_DIGEST_LENGTH * 2];
-    for (int i = 0; i < CC_SHA256_DIGEST_LENGTH; i++) {
-        [hashString appendFormat:@"%02x", hash[i]];
-    }
-    return hashString;
-}
-
-
-static BOOL signReceivedTweaks(NSString *tweakDir,
-                               NSArray<NSString *> *fileNames) {
+static BOOL signReceivedTweaks(NSArray<NSString *> *fileNames) {
   // Resolve LCSharedUtils (available in guest process)
   Class LCSharedUtils = NSClassFromString(@"LCSharedUtils");
   if (!LCSharedUtils) {
@@ -132,13 +103,9 @@ static BOOL signReceivedTweaks(NSString *tweakDir,
   if (!opensslLoaded) {
     NSString *opensslPath = [frameworksDir
         stringByAppendingPathComponent:@"OpenSSL.framework/OpenSSL"];
-    debug_print(@"OpenSSL path (I will check): %@", opensslPath);
-    // check if file exists
     if (![[NSFileManager defaultManager] fileExistsAtPath:opensslPath]) {
-      debug_print(@"OpenSSL not found at expected path: %@", opensslPath);
+      debug_print(@"OpenSSL not found at: %@", opensslPath);
       return NO;
-    } else {
-      debug_print(@"OpenSSL found at expected path: %@", opensslPath);
     }
     void *sslHandle = dlopen(opensslPath.UTF8String, RTLD_GLOBAL);
     if (!sslHandle) {
@@ -260,7 +227,7 @@ static BOOL signReceivedTweaks(NSString *tweakDir,
   }
 
   // Move signed dylibs back, overwriting originals
-  for (int i=0; i < tmpPaths.count; i++) {
+  for (int i = 0; i < tmpPaths.count; i++) {
     NSString *tmpPath = tmpPaths[i];
     NSString *name = [tmpPath lastPathComponent];
     NSString *dstPath = fileNames[i];
@@ -293,7 +260,17 @@ static BOOL signReceivedTweaks(NSString *tweakDir,
   return YES;
 }
 
-// Use BOOL for return type and correctly handle file writing
+static BOOL recv_exact(int sock, void *buf, size_t len) {
+  size_t received = 0;
+  while (received < len) {
+    ssize_t r = recv(sock, (char *)buf + received, len - received, 0);
+    if (r <= 0) return NO;
+    received += r;
+  }
+  return YES;
+}
+
+
 BOOL recv_to_file(int sock, FILE *fp, size_t total_len) {
   char buffer[8192];
   size_t received_so_far = 0;
@@ -331,121 +308,153 @@ static void init() {
     exit(1);
 
   // Receive "READY"
-  debug_print(@"Recving ready");
   char junk[1024];
   recv(sock, junk, sizeof(junk), 0);
-  debug_print(@"Recving count");
-  // Receive Number of Dylibs
+
+  // Receive manifest count
   uint32_t dylib_count = 0;
-  recv(sock, &dylib_count, 4, 0);
-  debug_print(@"Count 1: %d", dylib_count);
+  recv_exact(sock, &dylib_count, 4);
   dylib_count = ntohl(dylib_count);
-  debug_print(@"Count 2: %d", dylib_count);
+  debug_print(@"Manifest: %u dylibs", dylib_count);
 
-  NSString *basePath = [getActualContainerPath() stringByAppendingPathComponent:@"Documents/Tweaks/LiveTweaks"];
-  [[NSFileManager defaultManager] createDirectoryAtPath:basePath
-                            withIntermediateDirectories:YES
-                                             attributes:nil
-                                                  error:nil];
-  void **objs = malloc(sizeof(void *) * dylib_count);
-  NSMutableArray<NSString *> *receivedNames =
-      [NSMutableArray arrayWithCapacity:dylib_count];
-    NSMutableArray<NSString *> *receivedPaths =
-      [NSMutableArray arrayWithCapacity:dylib_count];
-    
-  NSString *nonLoaderPath = [basePath stringByAppendingPathComponent:@"Load"];
-  if ([[NSFileManager defaultManager] fileExistsAtPath:nonLoaderPath]) {
-    debug_print(@"Cleaning up existing Load directory at path: %@", nonLoaderPath);
-    [[NSFileManager defaultManager] removeItemAtPath:nonLoaderPath error:nil];
-  }
-  [[NSFileManager defaultManager] createDirectoryAtPath:nonLoaderPath
-                                withIntermediateDirectories:YES
-                                                 attributes:nil
-                                                      error:nil];
+  NSString *basePath = [getActualContainerPath()
+      stringByAppendingPathComponent:@"Documents/Tweaks/LiveTweaks"];
+  NSString *loadPath = [basePath stringByAppendingPathComponent:@"Load"];
+  NSFileManager *fm = [NSFileManager defaultManager];
+  [fm createDirectoryAtPath:basePath withIntermediateDirectories:YES
+                 attributes:nil error:nil];
+  [fm createDirectoryAtPath:loadPath withIntermediateDirectories:YES
+                 attributes:nil error:nil];
 
-  // ── Phase 1: Receive all dylibs to disk ──
-  for (int i = 0; i < dylib_count; i++) {
-    // Receive Name
+  // ── Phase 1: Receive manifest (name + sha256 per file) ──
+  NSMutableArray<NSString *> *allNames =
+      [NSMutableArray arrayWithCapacity:dylib_count];
+  NSMutableArray<NSString *> *allPaths =
+      [NSMutableArray arrayWithCapacity:dylib_count];
+  NSMutableArray<NSData *> *allHashes =
+      [NSMutableArray arrayWithCapacity:dylib_count];
+
+  for (uint32_t i = 0; i < dylib_count; i++) {
     uint32_t name_len = 0;
-    recv(sock, &name_len, 4, 0);
+    recv_exact(sock, &name_len, 4);
+    // name_len is little-endian ('<I') — no swap needed on LE arch
     char *name_buf = malloc(name_len + 1);
-    recv(sock, name_buf, name_len, 0);
+    recv_exact(sock, name_buf, name_len);
     name_buf[name_len] = '\0';
 
-    // Receive Data
-    uint32_t data_len = 0;
-    recv(sock, &data_len, 4, 0);
-    data_len = ntohl(data_len);
+    uint8_t hash_bytes[32];
+    recv_exact(sock, hash_bytes, 32);
 
     NSString *fileName = [NSString stringWithUTF8String:name_buf];
-    NSString *fullPath = nil;
-    if (![fileName isEqualToString:@"NetworkLoader.dylib"]) {
-      fullPath = [[basePath stringByAppendingPathComponent:@"Load"] stringByAppendingPathComponent:fileName];
+    free(name_buf);
+    NSString *fullPath = [fileName isEqualToString:@"NetworkLoader.dylib"]
+        ? [basePath stringByAppendingPathComponent:fileName]
+        : [loadPath stringByAppendingPathComponent:fileName];
+
+    [allNames addObject:fileName];
+    [allPaths addObject:fullPath];
+    [allHashes addObject:[NSData dataWithBytes:hash_bytes length:32]];
+  }
+
+  // Delete files in Load/ that are no longer in the manifest (+ their sidecars)
+  NSArray<NSString *> *existing =
+      [fm contentsOfDirectoryAtPath:loadPath error:nil] ?: @[];
+  NSSet<NSString *> *manifestNames = [NSSet setWithArray:allNames];
+  for (NSString *name in existing) {
+    if ([name hasSuffix:@".sha256"]) continue; // handled with their dylib
+    if (![manifestNames containsObject:name]) {
+      debug_print(@"Removing stale: %@", name);
+      [fm removeItemAtPath:[loadPath stringByAppendingPathComponent:name]
+                     error:nil];
+      [fm removeItemAtPath:[loadPath stringByAppendingPathComponent:
+                               [name stringByAppendingString:@".sha256"]]
+                     error:nil];
+    }
+  }
+
+  // Determine which files are missing or whose pre-signing hash has changed
+  NSMutableArray<NSNumber *> *neededIndices = [NSMutableArray array];
+  for (uint32_t i = 0; i < dylib_count; i++) {
+    NSString *sidecar = [allPaths[i] stringByAppendingString:@".sha256"];
+    NSData *stored = [NSData dataWithContentsOfFile:sidecar];
+    if (!stored || ![stored isEqualToData:allHashes[i]]) {
+      debug_print(@"%@: %@", allNames[i], stored ? @"hash mismatch" : @"missing");
+      [neededIndices addObject:@(i)];
     } else {
-      fullPath = [basePath stringByAppendingPathComponent:fileName];
+      debug_print(@"%@: up to date", allNames[i]);
     }
-    [receivedPaths addObject:fullPath];
-    const char *path = [fullPath UTF8String];
-    
-    debug_print(@"#%d needs to recva %d into %s", i, data_len, path);
+  }
 
-    // Clean start
+  // Send needed indices to server
+  uint32_t needed_count = htonl((uint32_t)neededIndices.count);
+  send(sock, &needed_count, 4, 0);
+  for (NSNumber *n in neededIndices) {
+    uint32_t idx = htonl(n.unsignedIntValue);
+    send(sock, &idx, 4, 0);
+  }
+  debug_print(@"Requesting %lu/%u files…",
+              (unsigned long)neededIndices.count, dylib_count);
+
+  // ── Phase 2: Receive only needed files ──
+  NSMutableArray<NSString *> *receivedPaths = [NSMutableArray array];
+  for (NSNumber *n in neededIndices) {
+    uint32_t i = n.unsignedIntValue;
+    const char *path = [allPaths[i] UTF8String];
+
+    uint32_t data_len = 0;
+    recv_exact(sock, &data_len, 4);
+    data_len = ntohl(data_len);
+    debug_print(@"#%u: receiving %@ (%u bytes)…", i, allNames[i], data_len);
+
     unlink(path);
-
     FILE *fp = fopen(path, "wb");
-    if (!fp) {
-      exit(1);
-    }
-
+    if (!fp) { exit(1); }
     if (!recv_to_file(sock, fp, data_len)) {
-      debug_print(@"ERROR: Cannot recv %s.", path);
+      debug_print(@"ERROR: Failed to receive %s", path);
       exit(1);
     }
     fclose(fp);
-    [receivedNames addObject:fileName];
-    free(name_buf);
+    // Persist the pre-signing hash so we can skip re-downloading on next run
+    NSString *sidecar = [allPaths[i] stringByAppendingString:@".sha256"];
+    [allHashes[i] writeToFile:sidecar atomically:YES];
+    [receivedPaths addObject:allPaths[i]];
   }
 
-  // ── Phase 2: Sign all received tweaks via LiveContainer's ZSign ──
-  debug_print(@"Signing %lu received tweaks…",
-              (unsigned long)receivedNames.count);
-  if (!signReceivedTweaks(basePath, receivedPaths)) {
-    debug_print(@"WARNING: Signing failed — dlopen may fail on "
-                @"JIT-less setups.");
-  } else {
-    debug_print(@"Signing succeeded for all tweaks.");
+  // ── Phase 3: Sign newly received tweaks ──
+  if (receivedPaths.count > 0) {
+    debug_print(@"Signing %lu tweaks…", (unsigned long)receivedPaths.count);
+    if (!signReceivedTweaks(receivedPaths)) {
+      debug_print(@"WARNING: Signing failed — dlopen may fail on JIT-less setups.");
+    } else {
+      debug_print(@"Signing succeeded.");
+    }
   }
 
-  debug_print(@"About to load %d tweaks, %d…", (int)receivedNames.count,
-              dylib_count);
-
-  // ── Phase 3: dlopen every signed dylib ──
-  for (int i = 0; i < dylib_count; i++) {
-    if ([receivedNames[i] isEqualToString:@"NetworkLoader.dylib"]) {
-      debug_print(@"Skipping reloading myself");
+  // ── Phase 4: dlopen all tweaks ──
+  debug_print(@"Loading %u tweaks…", dylib_count);
+  for (uint32_t i = 0; i < dylib_count; i++) {
+    if ([allNames[i] isEqualToString:@"NetworkLoader.dylib"]) {
+      debug_print(@"Skipping self-reload");
       continue;
     }
-    debug_print(@"%d: Loading tweaka %@…", i, receivedNames[i]);
-    NSString *fullPath = receivedPaths[i];
-    const char *path = [fullPath UTF8String];
+    const char *path = [allPaths[i] UTF8String];
     debug_print(@"Loading %s…", path);
     void *h = dlopen(path, RTLD_NOW | RTLD_GLOBAL);
     if (!h) {
       debug_print(@"[!] Failed to load %s: %s", path, dlerror());
       exit(1);
     }
-    objs[i] = h;
     debug_print(@"Loaded %s successfully.", path);
   }
   debug_print(@"Finished loading");
-  dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH,
-     0), ^{ debug_print(@"Finished loading - now im gonna wait");
-          char monitor[1];
-          if (recv(sock, monitor, 1, 0) > 0) {
-            debug_print(@"Received kill ping");
-            abort();
-          }
-      });
+  dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
+    debug_print(@"Waiting for kill ping…");
+    char monitor[1];
+    if (recv(sock, monitor, 1, 0) > 0) {
+      debug_print(@"Received kill ping");
+      abort();
+    }
+  });
 }
 
 
