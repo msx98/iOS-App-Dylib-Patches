@@ -14,7 +14,7 @@ tweaks/         Tweak source files (.m) organized by app
 lib/
   fishhook/     Facebook's PLT hooking library (submodule)
   LiveContainer/ LiveContainer framework headers (submodule)
-  utils/        Shared headers: utils.h, foundation.h, logger2.m
+  utils/        Shared headers: utils.h, foundation.h, logger.m
 scripts/
   compile.sh                     Main compiler script
   compile_network_dylib_loader.sh Compile NetworkLoader/DylibLoaderNew
@@ -56,7 +56,7 @@ This compiles, signs with the SideStore certificate in the local keychain, then 
 
 - Target: `arm64-apple-ios26.3`
 - SDK: `$(xcrun --sdk iphoneos --show-sdk-path)`
-- Always linked: `fishhook`, `lib/utils/logger2.m`, Foundation, UIKit, CoreAudio, AVFoundation, CoreMedia, CoreVideo, AudioToolbox
+- Always linked: `fishhook`, `lib/utils/logger.m`, Foundation, UIKit, CoreAudio, AVFoundation, CoreMedia, CoreVideo, AudioToolbox
 - Flags: `-fobjc-arc`, `-shared`, `-fmodules`
 - Customize via env vars: `EXTRA_INCLUDES`, `EXTRA_SOURCES`, `EXTRA_FRAMEWORKS`
 
@@ -71,7 +71,7 @@ This compiles, signs with the SideStore certificate in the local keychain, then 
 - **Function hooking**: Use `fishhook` (`rebind_symbols`) for C/system functions (e.g. `AudioUnitRender`, `openURL`)
 - **Method swizzling**: Use Objective-C runtime (`method_exchangeImplementations`) for ObjC methods
 - **Dynamic symbol resolution**: Use `dlsym()` + `dlopen()` to call LiveContainer symbols at runtime without linking
-- **Shared utilities**: Include `lib/utils/utils.h` to get `foundation.h` and `logger2.m` network logging
+- **Shared utilities**: Include `lib/utils/utils.m` to get `foundation.h` and `logger.m` network logging
 
 ## Certificates and Signing (gitignored)
 

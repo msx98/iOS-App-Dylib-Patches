@@ -1,7 +1,7 @@
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
 
-#import "utils/utils.h"
+#import "utils/utils.m"
 INITIALIZE("WaLogger");
 
 static void write_to_log_file(NSString *message) {
