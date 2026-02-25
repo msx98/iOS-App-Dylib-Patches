@@ -20,6 +20,36 @@
 //   2. Load ZSign.dylib, get provisioning profile + cert from the host
 //   3. Call [ZSigner signWithAppPath:prov:key:pass:completionHandler:]
 //   4. Move signed dylibs back, clean up
+
+
+#import <CommonCrypto/CommonDigest.h>
+
+static NSString *sha256ForFile(NSString *path) {
+    FILE *fp = fopen(path.UTF8String, "rb");
+    if (!fp) return nil;
+
+    unsigned char hash[CC_SHA256_DIGEST_LENGTH];
+    CC_SHA256_CTX sha256;
+    CC_SHA256_Init(&sha256);
+
+    const int bufSize = 32768;
+    unsigned char *buffer = malloc(bufSize);
+    size_t bytesRead = 0;
+    while ((bytesRead = fread(buffer, 1, bufSize, fp)) > 0) {
+        CC_SHA256_Update(&sha256, buffer, (CC_LONG)bytesRead);
+    }
+    free(buffer);
+    fclose(fp);
+
+    CC_SHA256_Final(hash, &sha256);
+    NSMutableString *hashString = [NSMutableString stringWithCapacity:CC_SHA256_DIGEST_LENGTH * 2];
+    for (int i = 0; i < CC_SHA256_DIGEST_LENGTH; i++) {
+        [hashString appendFormat:@"%02x", hash[i]];
+    }
+    return hashString;
+}
+
+
 static BOOL signReceivedTweaks(NSString *tweakDir,
                                NSArray<NSString *> *fileNames) {
   // Resolve LCSharedUtils (available in guest process)
