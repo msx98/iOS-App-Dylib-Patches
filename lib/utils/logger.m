@@ -26,10 +26,11 @@ typedef struct NetworkLogger {
 
 static inline void network_logger_init(NetworkLogger *l, const char *name,
                                        uint16_t port) {
+  os_log(OS_LOG_DEFAULT, "Initializing NetworkLogger: %{public}s", name);
   memset(l, 0, sizeof(*l));
   strlcpy(l->name, name, sizeof(l->name));
-
   getControllerIP();
+  os_log(OS_LOG_DEFAULT, "Controller IP: %{public}s", CONTROLLER_IP.UTF8String);
   if (CONTROLLER_IP != nil) {
     l->sock = socket(AF_INET, SOCK_DGRAM, 0);
     l->addr.sin_family = AF_INET;
