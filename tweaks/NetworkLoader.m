@@ -316,7 +316,7 @@ static void init() {
       stringByAppendingPathComponent:@"Documents/Tweaks/LiveTweaks"];
   NSString *loadPath = [basePath stringByAppendingPathComponent:@"Load"];
   NSFileManager *fm = [NSFileManager defaultManager];
-  [fm createDirectoryAtPath:basePath
+  [fm createDirectoryAtPath:[basePath stringByAppendingPathComponent:@"0"]
       withIntermediateDirectories:YES
                        attributes:nil
                             error:nil];
@@ -348,7 +348,8 @@ static void init() {
     free(name_buf);
     NSString *fullPath =
         [fileName isEqualToString:@"NetworkLoader.dylib"]
-            ? [basePath stringByAppendingPathComponent:fileName]
+            ? [[basePath stringByAppendingPathComponent:@"0"]
+                  stringByAppendingPathComponent:fileName]
             : [loadPath stringByAppendingPathComponent:fileName];
 
     [allNames addObject:fileName];
