@@ -21,7 +21,6 @@
 //   3. Call [ZSigner signWithAppPath:prov:key:pass:completionHandler:]
 //   4. Move signed dylibs back, clean up
 
-
 static BOOL signReceivedTweaks(NSArray<NSString *> *fileNames) {
   // Resolve LCSharedUtils (available in guest process)
   Class LCSharedUtils = NSClassFromString(@"LCSharedUtils");
@@ -57,29 +56,11 @@ static BOOL signReceivedTweaks(NSArray<NSString *> *fileNames) {
                 (unsigned long)certData.length);
   }
 
-  // Get LiveContainer's original bundle via the lcMainBundle global
-  // (set in LCBootstrap.m before mainBundle is swizzled to the guest app)
-  NSBundle **lcMainBundlePtr = (NSBundle **)dlsym(RTLD_DEFAULT, "lcMainBundle");
-  debug_print(@"lcMainBundle pointer: %p", lcMainBundlePtr);
-  NSBundle *hostBundle = lcMainBundlePtr ? *lcMainBundlePtr : nil;
-  debug_print(@"hostBundle pointer 1: %p", hostBundle);
+  NSBundle *hostBundle = getActualHostBundle();
   if (!hostBundle) {
-    debug_print(@"lcMainBundle not found via dlsym.");
+    debug_print(@"Host bundle not found, cannot proceed with signing.");
     return NO;
   }
-
-  // lcMainBundle may point to LiveProcess.appex — walk up to the main .app
-  // LiveProcess.appex -> PlugIns/ -> LiveContainer.app
-  NSString *bundlePath = hostBundle.bundlePath;
-  if ([bundlePath.pathExtension isEqualToString:@"appex"]) {
-    NSString *mainAppPath = [[bundlePath stringByDeletingLastPathComponent]
-        stringByDeletingLastPathComponent];
-    NSBundle *mainAppBundle = [NSBundle bundleWithPath:mainAppPath];
-    if (mainAppBundle) {
-      hostBundle = mainAppBundle;
-    }
-  }
-  debug_print(@"Host bundle path: %@", hostBundle.bundlePath);
 
   // Get embedded.mobileprovision from the host bundle
   NSURL *profileURL = [hostBundle URLForResource:@"embedded"
@@ -264,12 +245,12 @@ static BOOL recv_exact(int sock, void *buf, size_t len) {
   size_t received = 0;
   while (received < len) {
     ssize_t r = recv(sock, (char *)buf + received, len - received, 0);
-    if (r <= 0) return NO;
+    if (r <= 0)
+      return NO;
     received += r;
   }
   return YES;
 }
-
 
 BOOL recv_to_file(int sock, FILE *fp, size_t total_len) {
   char buffer[8192];
@@ -302,7 +283,21 @@ static void init() {
   struct sockaddr_in addr;
   addr.sin_family = AF_INET;
   addr.sin_port = htons(8887);
-  addr.sin_addr.s_addr = inet_addr("192.168.1.23");
+  NSLog(@"[NetworkLoader] Connecting to controller 2 at %s:8887…",
+        CONTROLLER_IP.UTF8String);
+  os_log(OS_LOG_DEFAULT, "[NetworkLoader] Controller IP 2: %{public}s",
+         CONTROLLER_IP.UTF8String);
+  getControllerIP();
+  NSLog(@"[NetworkLoader] Connecting to controller 2 at %s:8887…",
+        CONTROLLER_IP.UTF8String);
+  os_log(OS_LOG_DEFAULT, "[NetworkLoader] Controller IP 2: %{public}s",
+         CONTROLLER_IP.UTF8String);
+  // NSLog(@"[NetworkLoader] Controller IP: %s", CONTROLLER_IP.UTF8String); //
+  // shows controller IP as "private"
+
+  NSLog(@"[NetworkLoader] Controller IP 3: %@",
+        CONTROLLER_IP); // shows controller
+  addr.sin_addr.s_addr = inet_addr(CONTROLLER_IP.UTF8String);
 
   if (connect(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0)
     exit(1);
@@ -321,10 +316,14 @@ static void init() {
       stringByAppendingPathComponent:@"Documents/Tweaks/LiveTweaks"];
   NSString *loadPath = [basePath stringByAppendingPathComponent:@"Load"];
   NSFileManager *fm = [NSFileManager defaultManager];
-  [fm createDirectoryAtPath:basePath withIntermediateDirectories:YES
-                 attributes:nil error:nil];
-  [fm createDirectoryAtPath:loadPath withIntermediateDirectories:YES
-                 attributes:nil error:nil];
+  [fm createDirectoryAtPath:basePath
+      withIntermediateDirectories:YES
+                       attributes:nil
+                            error:nil];
+  [fm createDirectoryAtPath:loadPath
+      withIntermediateDirectories:YES
+                       attributes:nil
+                            error:nil];
 
   // ── Phase 1: Receive manifest (name + sha256 per file) ──
   NSMutableArray<NSString *> *allNames =
@@ -347,9 +346,10 @@ static void init() {
 
     NSString *fileName = [NSString stringWithUTF8String:name_buf];
     free(name_buf);
-    NSString *fullPath = [fileName isEqualToString:@"NetworkLoader.dylib"]
-        ? [basePath stringByAppendingPathComponent:fileName]
-        : [loadPath stringByAppendingPathComponent:fileName];
+    NSString *fullPath =
+        [fileName isEqualToString:@"NetworkLoader.dylib"]
+            ? [basePath stringByAppendingPathComponent:fileName]
+            : [loadPath stringByAppendingPathComponent:fileName];
 
     [allNames addObject:fileName];
     [allPaths addObject:fullPath];
@@ -361,13 +361,15 @@ static void init() {
       [fm contentsOfDirectoryAtPath:loadPath error:nil] ?: @[];
   NSSet<NSString *> *manifestNames = [NSSet setWithArray:allNames];
   for (NSString *name in existing) {
-    if ([name hasSuffix:@".sha256"]) continue; // handled with their dylib
+    if ([name hasSuffix:@".sha256"])
+      continue; // handled with their dylib
     if (![manifestNames containsObject:name]) {
       debug_print(@"Removing stale: %@", name);
       [fm removeItemAtPath:[loadPath stringByAppendingPathComponent:name]
                      error:nil];
-      [fm removeItemAtPath:[loadPath stringByAppendingPathComponent:
-                               [name stringByAppendingString:@".sha256"]]
+      [fm removeItemAtPath:[loadPath
+                               stringByAppendingPathComponent:
+                                   [name stringByAppendingString:@".sha256"]]
                      error:nil];
     }
   }
@@ -378,7 +380,8 @@ static void init() {
     NSString *sidecar = [allPaths[i] stringByAppendingString:@".sha256"];
     NSData *stored = [NSData dataWithContentsOfFile:sidecar];
     if (!stored || ![stored isEqualToData:allHashes[i]]) {
-      debug_print(@"%@: %@", allNames[i], stored ? @"hash mismatch" : @"missing");
+      debug_print(@"%@: %@", allNames[i],
+                  stored ? @"hash mismatch" : @"missing");
       [neededIndices addObject:@(i)];
     } else {
       debug_print(@"%@: up to date", allNames[i]);
@@ -392,8 +395,8 @@ static void init() {
     uint32_t idx = htonl(n.unsignedIntValue);
     send(sock, &idx, 4, 0);
   }
-  debug_print(@"Requesting %lu/%u files…",
-              (unsigned long)neededIndices.count, dylib_count);
+  debug_print(@"Requesting %lu/%u files…", (unsigned long)neededIndices.count,
+              dylib_count);
 
   // ── Phase 2: Receive only needed files ──
   NSMutableArray<NSString *> *receivedPaths = [NSMutableArray array];
@@ -408,7 +411,9 @@ static void init() {
 
     unlink(path);
     FILE *fp = fopen(path, "wb");
-    if (!fp) { exit(1); }
+    if (!fp) {
+      exit(1);
+    }
     if (!recv_to_file(sock, fp, data_len)) {
       debug_print(@"ERROR: Failed to receive %s", path);
       exit(1);
@@ -424,7 +429,8 @@ static void init() {
   if (receivedPaths.count > 0) {
     debug_print(@"Signing %lu tweaks…", (unsigned long)receivedPaths.count);
     if (!signReceivedTweaks(receivedPaths)) {
-      debug_print(@"WARNING: Signing failed — dlopen may fail on JIT-less setups.");
+      debug_print(
+          @"WARNING: Signing failed — dlopen may fail on JIT-less setups.");
     } else {
       debug_print(@"Signing succeeded.");
     }
@@ -456,6 +462,5 @@ static void init() {
     }
   });
 }
-
 
 INITIALIZE("NetworkLoader")

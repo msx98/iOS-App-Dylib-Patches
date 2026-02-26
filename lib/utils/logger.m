@@ -11,6 +11,8 @@
 #import <sys/socket.h>
 #import <unistd.h>
 
+#include "utils.h"
+
 // ── C struct-based logger ──
 
 typedef struct NetworkLogger {
@@ -23,26 +25,27 @@ typedef struct NetworkLogger {
 // ── Functions (static inline, header-only) ──
 
 static inline void network_logger_init(NetworkLogger *l, const char *name,
-                                       const char *ip, uint16_t port) {
+                                       uint16_t port) {
   memset(l, 0, sizeof(*l));
   strlcpy(l->name, name, sizeof(l->name));
 
-  l->sock = socket(AF_INET, SOCK_DGRAM, 0);
-  l->addr.sin_family = AF_INET;
-  l->addr.sin_port = htons(port);
-  inet_pton(AF_INET, ip, &l->addr.sin_addr);
-
-  l->send_queue =
-      dispatch_queue_create("com.networklogger.send", DISPATCH_QUEUE_SERIAL);
-  NSLog(@"[%s] Initialized (-> %s:%u)", l->name, ip, port);
+  getControllerIP();
+  if (CONTROLLER_IP != nil) {
+    l->sock = socket(AF_INET, SOCK_DGRAM, 0);
+    l->addr.sin_family = AF_INET;
+    l->addr.sin_port = htons(port);
+    inet_pton(AF_INET, CONTROLLER_IP.UTF8String, &l->addr.sin_addr);
+    l->send_queue =
+        dispatch_queue_create("com.networklogger.send", DISPATCH_QUEUE_SERIAL);
+  }
 }
 
 static inline void network_logger_print(NetworkLogger *l, NSString *message) {
-  NSData *data = [[NSString stringWithFormat:@"[%s] %@\n", l->name, message]
+  NSString *dataString =
+      [NSString stringWithFormat:@"[%s] %@", l->name, message];
+  NSData *data = [[dataString stringByAppendingString:@"\n"]
       dataUsingEncoding:NSUTF8StringEncoding];
-  // Local log
-  NSLog(@"[NSLog] [%s] %@", l->name, message);
-  os_log(OS_LOG_DEFAULT, "%@", message);
+  os_log(OS_LOG_DEFAULT, "%s", dataString.UTF8String);
 
   // UDP send (async)
   int fd = l->sock;
@@ -71,8 +74,6 @@ static NetworkLogger logger; // Global instance
 
 // Declare + initialise a NetworkLogger on the stack (or as a static/global).
 //   INIT_LOGGER(logger, "MyTweak", "192.168.1.50", 11909);
-#define INIT_LOGGER(name)                                                      \
-  network_logger_init(&logger, name, "192.168.1.23", 8889);
 
 // printf-style logging through a NetworkLogger.
 //   debug_log(&logger, @"count = %d", n);
@@ -80,6 +81,12 @@ static NetworkLogger logger; // Global instance
   do {                                                                         \
     network_logger_print(&logger,                                              \
                          [NSString stringWithFormat:(fmt), ##__VA_ARGS__]);    \
+  } while (0);
+
+#define INIT_LOGGER(name)                                                      \
+  do {                                                                         \
+    network_logger_init(&logger, name, 8889);                                  \
+    debug_print(@"Logger initialized");                                        \
   } while (0);
 
 #endif

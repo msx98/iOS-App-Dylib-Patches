@@ -132,6 +132,9 @@ with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
     s.listen(8)
     t.start()
 
+    utils_dir = Path("lib/utils")
+    max_mtime = max((f.stat().st_mtime for f in utils_dir.glob("*") if f.is_file()), default=0)
+
     print(f"[*] DYLIB Waiting for iPhone connections on tcp://{ip_addr}:{DYLIB_PORT}...")
     conns = []
 
@@ -147,7 +150,7 @@ with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                 if file.suffix in [".m", ".mm"]:
                     dylib_file = Path("build") / file.with_suffix('.dylib').name
                     m_file = Path(file.resolve())
-                    if (not dylib_file.exists()) or (dylib_file.stat().st_mtime < m_file.stat().st_mtime):
+                    if (not dylib_file.exists()) or (dylib_file.stat().st_mtime < max(max_mtime, m_file.stat().st_mtime)):
                         print(f"[*] Building {dylib_file} from {m_file}...")
                         os.system(f"bash scripts/compile {m_file}")
                 elif file.suffix == ".dylib":
