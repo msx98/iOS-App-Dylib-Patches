@@ -2,6 +2,7 @@
 #import <AudioToolbox/AudioToolbox.h>
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
+#include <stdint.h>
 
 #include "../../lib/utils/utils.m"
 
@@ -41,7 +42,10 @@ typedef struct {
 // --- Globals ---
 static WavRecorder micRecorder;
 static WavRecorder speakerRecorder;
-static AudioStreamBasicDescription capturedASBD;
+static AudioStreamBasicDescription micASBD;
+static AudioStreamBasicDescription speakerASBD;
+static BOOL micASBDCaptured;
+static BOOL speakerASBDCaptured;
 static CallInfo g_callInfo;
 
 static OSStatus (*orig_AudioUnitRender)(AudioUnit, AudioUnitRenderActionFlags *,
@@ -70,19 +74,18 @@ static void updateWavHeader(WavRecorder *recorder) {
   [recorder->fileHandle synchronizeFile];
 }
 
-static void writeInitialHeader(NSFileHandle *handle) {
+static void writeInitialHeader(NSFileHandle *handle,
+                               AudioStreamBasicDescription *asbd) {
   WavHeader h;
   memcpy(h.riff, "RIFF", 4);
   memcpy(h.wave, "WAVE", 4);
   memcpy(h.fmt, "fmt ", 4);
   h.fmtLen = 16;
-  h.format = 3; // f32le
-  h.sampleRate =
-      capturedASBD.mSampleRate > 0 ? (uint32_t)capturedASBD.mSampleRate : 16000;
-  h.channels = capturedASBD.mChannelsPerFrame > 0
-                   ? (uint16_t)capturedASBD.mChannelsPerFrame
-                   : 1;
-  h.bitsPerSample = 32;
+  BOOL isFloat = (asbd->mFormatFlags & kAudioFormatFlagIsFloat) != 0;
+  h.format = isFloat ? 3 : 1; // 3=IEEE float, 1=PCM int
+  h.sampleRate = asbd->mSampleRate > 0 ? (uint32_t)asbd->mSampleRate : 48000;
+  h.channels = asbd->mChannelsPerFrame > 0 ? (uint16_t)asbd->mChannelsPerFrame : 1;
+  h.bitsPerSample = asbd->mBitsPerChannel > 0 ? (uint16_t)asbd->mBitsPerChannel : 32;
   h.byteRate = h.sampleRate * h.channels * (h.bitsPerSample / 8);
   h.blockAlign = h.channels * (h.bitsPerSample / 8);
   memcpy(h.data, "data", 4);
@@ -91,7 +94,8 @@ static void writeInitialHeader(NSFileHandle *handle) {
   [handle writeData:[NSData dataWithBytes:&h length:sizeof(WavHeader)]];
 }
 
-static NSFileHandle *createCaptureFile(NSString *suffix) {
+static NSFileHandle *createCaptureFile(NSString *suffix,
+                                       AudioStreamBasicDescription *asbd) {
   NSString *docPath = [NSSearchPathForDirectoriesInDomains(
       NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
   NSString *dirPath = [[[docPath stringByAppendingPathComponent:@"CallRecord"]
@@ -111,18 +115,18 @@ static NSFileHandle *createCaptureFile(NSString *suffix) {
                                         attributes:nil];
   NSFileHandle *handle = [NSFileHandle fileHandleForWritingAtPath:path];
   if (handle) {
-    writeInitialHeader(handle);
+    writeInitialHeader(handle, asbd);
     debug_print(@"[CallRecordWav] Recording → %@", path);
   }
   return handle;
 }
 
 static void appendAudio(WavRecorder *recorder, AudioBufferList *ioData,
-                        NSString *suffix) {
+                        NSString *suffix, AudioStreamBasicDescription *asbd) {
   if (!g_callInfo.isActive || !ioData)
     return;
   if (!recorder->isInitialized) {
-    recorder->fileHandle = createCaptureFile(suffix);
+    recorder->fileHandle = createCaptureFile(suffix, asbd);
     recorder->isInitialized = YES;
   }
   if (!recorder->fileHandle)
@@ -150,6 +154,8 @@ static void finalizeRecorders(void) {
     [micRecorder.fileHandle closeFile];
     micRecorder = (WavRecorder){0};
   }
+  micASBDCaptured = NO;
+  speakerASBDCaptured = NO;
   if (speakerRecorder.fileHandle) {
     updateWavHeader(&speakerRecorder);
     [speakerRecorder.fileHandle closeFile];
@@ -171,7 +177,7 @@ static OSStatus speakerRenderNotify(void *inRefCon,
                                     AudioBufferList *ioData) {
   if ((*ioActionFlags & kAudioUnitRenderAction_PostRender) &&
       inBusNumber == 0 && ioData)
-    appendAudio(&speakerRecorder, ioData, @"speaker");
+    appendAudio(&speakerRecorder, ioData, @"speaker", &speakerASBD);
   return noErr;
 }
 
@@ -183,8 +189,23 @@ hooked_AudioUnitRender(AudioUnit inUnit,
                        UInt32 inNumberFrames, AudioBufferList *ioData) {
   OSStatus status = orig_AudioUnitRender(inUnit, ioActionFlags, inTimeStamp,
                                          inBusNumber, inNumberFrames, ioData);
-  if (status == noErr && inBusNumber == 1 && ioData)
-    appendAudio(&micRecorder, ioData, @"mic");
+  if (status == noErr && inBusNumber == 1 && ioData) {
+    // Query live format once so the WAV header reflects the actual data format.
+    if (!micASBDCaptured) {
+      AudioStreamBasicDescription q = {0};
+      UInt32 sz = sizeof(q);
+      if (AudioUnitGetProperty(inUnit, kAudioUnitProperty_StreamFormat,
+                               kAudioUnitScope_Output, 1, &q, &sz) == noErr) {
+        micASBD = q;
+      }
+      micASBDCaptured = YES;
+      debug_print(
+          @"[CallRecordWav] Mic live ASBD: %.0f Hz, %d ch, %d bpc, flags=0x%x",
+          micASBD.mSampleRate, (int)micASBD.mChannelsPerFrame,
+          (int)micASBD.mBitsPerChannel, (unsigned int)micASBD.mFormatFlags);
+    }
+    appendAudio(&micRecorder, ioData, @"mic", &micASBD);
+  }
   return status;
 }
 
@@ -196,9 +217,17 @@ hooked_AudioUnitSetProperty(AudioUnit inUnit, AudioUnitPropertyID inID,
                             const void *inData, UInt32 inDataSize) {
   if (inID == kAudioUnitProperty_StreamFormat && inData &&
       inDataSize >= sizeof(AudioStreamBasicDescription)) {
-    capturedASBD = *(AudioStreamBasicDescription *)inData;
-    debug_print(@"[CallRecordWav] ASBD: %.0f Hz, %d ch",
-                capturedASBD.mSampleRate, capturedASBD.mChannelsPerFrame);
+    AudioStreamBasicDescription asbd = *(AudioStreamBasicDescription *)inData;
+    if (inElement == 1) {
+      // Log what WhatsApp reports but keep mic hardcoded to 16kHz mono
+      debug_print(
+          @"[CallRecordWav] Mic ASBD (reported, ignored): %.0f Hz, %d ch",
+          asbd.mSampleRate, (int)asbd.mChannelsPerFrame);
+    } else {
+      speakerASBD = asbd;
+      debug_print(@"[CallRecordWav] Speaker ASBD: %.0f Hz, %d ch",
+                  speakerASBD.mSampleRate, (int)speakerASBD.mChannelsPerFrame);
+    }
   }
   return orig_AudioUnitSetProperty(inUnit, inID, inScope, inElement, inData,
                                    inDataSize);
@@ -206,6 +235,20 @@ hooked_AudioUnitSetProperty(AudioUnit inUnit, AudioUnitPropertyID inID,
 
 // Install render notify for speaker capture when the I/O unit starts.
 static OSStatus hooked_AudioOutputUnitStart(AudioUnit unit) {
+  // Query speaker format here — safe to call outside the audio render thread.
+  if (!speakerASBDCaptured) {
+    AudioStreamBasicDescription q = {0};
+    UInt32 sz = sizeof(q);
+    if (AudioUnitGetProperty(unit, kAudioUnitProperty_StreamFormat,
+                             kAudioUnitScope_Output, 0, &q, &sz) == noErr &&
+        q.mSampleRate > 0) {
+      speakerASBD = q;
+    }
+    speakerASBDCaptured = YES;
+    debug_print(@"[CallRecordWav] Speaker ASBD: %.0f Hz, %d ch, %d bpc, flags=0x%x",
+                speakerASBD.mSampleRate, (int)speakerASBD.mChannelsPerFrame,
+                (int)speakerASBD.mBitsPerChannel, (unsigned int)speakerASBD.mFormatFlags);
+  }
   OSStatus err = AudioUnitAddRenderNotify(unit, speakerRenderNotify, NULL);
   debug_print(@"[CallRecordWav] Render notify on I/O unit: %s (err=%d)",
               err == noErr ? "ok" : "FAILED", (int)err);
