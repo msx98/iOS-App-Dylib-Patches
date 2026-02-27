@@ -3,6 +3,7 @@
 from typing import Tuple, Dict
 import socket
 import select
+from dotenv import dotenv_values
 import sys
 import os
 import glob
@@ -148,17 +149,24 @@ with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             conn, addr = s.accept()
             conns.append(conn)
             print(f"[*] Connected by {addr}")
+            import subprocess
 
             # Build all dylibs and compute their hashes upfront
+            failed = False
             file_infos = []  # list of (name_bytes, sha256_bytes, data_bytes)
             for file in load_files:
                 if file.suffix in [".m", ".mm"]:
                     dylib_file = Path("build") / file.with_suffix('.dylib').name
+                    dotenv_file = file.with_suffix('.env')
                     m_file = Path(file.resolve())
                     if (not dylib_file.exists()) or (dylib_file.stat().st_mtime < max(max_mtime, m_file.stat().st_mtime)):
                         print(f"[*] Building {dylib_file} from {m_file}...")
-                        env = "CLANG_EXTRA_LINKS=sqlite3 " if file.name == "NetworkLoader.m" else ""
-                        os.system(f"{env}bash scripts/compile {m_file}")
+                        env_vars = dotenv_values(dotenv_file) if dotenv_file.exists() else {}
+                        result = subprocess.run(["bash", "scripts/compile", str(m_file)], capture_output=True, text=True, env={**os.environ, **env_vars})
+                        if result.returncode != 0:
+                            print(f"ERROR: Failed to compile {m_file}:\n{result.stderr}")
+                            failed = True
+                            continue
                 elif file.suffix == ".dylib":
                     dylib_file = file
                 else:
@@ -166,11 +174,17 @@ with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                 with open(dylib_file, 'rb') as f:
                     data = f.read()
                 #name = os.path.basename(dylib_file).encode()
-                name = str(dylib_file.resolve()).encode()
+                name = str(file.resolve()).encode()
                 sha256 = hashlib.sha256(data).digest()
                 mtime = int(dylib_file.stat().st_mtime)
                 file_infos.append((name, sha256, mtime, data))
                 print(f"[*] {dylib_file.name}: {len(data)} bytes, sha256={sha256.hex()[:16]}…")
+
+            if failed:
+                print("[*] Build failed for one or more files. Not sending anything to the iPhone.")
+                conn.sendall(b"ERROR\n")
+                conn.close()
+                continue
 
             # Send READY + manifest (count, then name+sha256+mtime per file)
             conn.sendall(b"READY\n")

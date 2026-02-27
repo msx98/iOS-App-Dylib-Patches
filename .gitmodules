@@ -4,3 +4,6 @@
 [submodule "LiveContainer"]
 	path = lib/LiveContainer
 	url = git@github.com:LiveContainer/LiveContainer.git
+[submodule "lib/Dobby"]
+	path = lib/Dobby
+	url = git@github.com:jmpews/Dobby.git
