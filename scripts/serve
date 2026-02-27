@@ -165,7 +165,8 @@ with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                     continue
                 with open(dylib_file, 'rb') as f:
                     data = f.read()
-                name = os.path.basename(dylib_file).encode()
+                #name = os.path.basename(dylib_file).encode()
+                name = str(dylib_file.resolve()).encode()
                 sha256 = hashlib.sha256(data).digest()
                 mtime = int(dylib_file.stat().st_mtime)
                 file_infos.append((name, sha256, mtime, data))

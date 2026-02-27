@@ -13,126 +13,6 @@
 
 #import "../lib/utils/utils.m"
 
-// ── SQLite tweak registry ─────────────────────────────────────────────────
-// Schema: PRIMARY KEY (basename, position), remotePath UNIQUE,
-//         unsignedHash BLOB, updateTime INTEGER
-//         local name = {basename}.{position}.{last8hexOfSha256}
-static sqlite3 *g_db = NULL;
-
-static void db_open(NSString *path) {
-  if (sqlite3_open(path.UTF8String, &g_db) != SQLITE_OK) {
-    debug_print(@"sqlite3_open failed: %s", sqlite3_errmsg(g_db));
-    g_db = NULL;
-    return;
-  }
-  const char *ddl = "CREATE TABLE IF NOT EXISTS tweaks ("
-                    "  basename       TEXT    NOT NULL,"
-                    "  position       INTEGER NOT NULL," // rank among rows with same basename; local name = {basename}.{position}.{last8hexOfSha256}
-                    "  remotePath     TEXT    NOT NULL UNIQUE,"
-                    "  unsignedHash   BLOB    NOT NULL,"
-                    "  updateTime     INTEGER NOT NULL,"
-                    "  PRIMARY KEY (basename, position)"
-                    ")";
-  char *err = NULL;
-  if (sqlite3_exec(g_db, ddl, NULL, NULL, &err) != SQLITE_OK) {
-    debug_print(@"CREATE TABLE failed: %s", err);
-    sqlite3_free(err);
-  }
-}
-
-// Local name format: "{basename}.{position}.{last8hexOfSha256}"
-static NSString *makeLocalName(NSString *remotePath, int64_t position,
-                               NSData *sha256) {
-  const uint8_t *b = (const uint8_t *)sha256.bytes;
-  NSString *tail = [NSString stringWithFormat:@"%02x%02x%02x%02x",
-                    b[28], b[29], b[30], b[31]];
-  NSString *base = [remotePath.lastPathComponent stringByDeletingPathExtension];
-  return [NSString stringWithFormat:@"%@.%lld.%@", base, (long long)position,
-                   tail];
-}
-
-// Returns the stored position for an existing row, or the next available rank
-// for a new one (MAX(position)+1 among rows with the same basename).
-static int64_t db_resolve_position(NSString *remotePath) {
-  if (!g_db)
-    return 1;
-  sqlite3_stmt *st = NULL;
-  sqlite3_prepare_v2(g_db,
-                     "SELECT position FROM tweaks WHERE remotePath=? LIMIT 1",
-                     -1, &st, NULL);
-  sqlite3_bind_text(st, 1, remotePath.UTF8String, -1, SQLITE_TRANSIENT);
-  int64_t pos = 0;
-  if (sqlite3_step(st) == SQLITE_ROW)
-    pos = sqlite3_column_int64(st, 0);
-  sqlite3_finalize(st);
-  if (pos > 0)
-    return pos;
-  // New row: next rank for this basename.
-  NSString *base = [remotePath.lastPathComponent stringByDeletingPathExtension];
-  sqlite3_prepare_v2(
-      g_db, "SELECT COALESCE(MAX(position), 0) + 1 FROM tweaks WHERE basename=?",
-      -1, &st, NULL);
-  sqlite3_bind_text(st, 1, base.UTF8String, -1, SQLITE_TRANSIENT);
-  pos = 1;
-  if (sqlite3_step(st) == SQLITE_ROW)
-    pos = sqlite3_column_int64(st, 0);
-  sqlite3_finalize(st);
-  return pos;
-}
-
-// Reconstruct the local name for a stored row, or nil if not found.
-static NSString *db_lookup_localName(NSString *remotePath) {
-  if (!g_db)
-    return nil;
-  sqlite3_stmt *st = NULL;
-  sqlite3_prepare_v2(
-      g_db,
-      "SELECT basename, position, unsignedHash FROM tweaks WHERE remotePath=? LIMIT 1",
-      -1, &st, NULL);
-  sqlite3_bind_text(st, 1, remotePath.UTF8String, -1, SQLITE_TRANSIENT);
-  NSString *localName = nil;
-  if (sqlite3_step(st) == SQLITE_ROW) {
-    const char *base = (const char *)sqlite3_column_text(st, 0);
-    int64_t pos = sqlite3_column_int64(st, 1);
-    const uint8_t *b = (const uint8_t *)sqlite3_column_blob(st, 2);
-    int len = sqlite3_column_bytes(st, 2);
-    if (base && b && len >= 32) {
-      NSString *tail = [NSString stringWithFormat:@"%02x%02x%02x%02x",
-                        b[28], b[29], b[30], b[31]];
-      localName = [NSString stringWithFormat:@"%s.%lld.%@", base,
-                             (long long)pos, tail];
-    }
-  }
-  sqlite3_finalize(st);
-  return localName;
-}
-
-static void db_upsert(NSString *remotePath, NSData *unsignedHash,
-                      int64_t updateTime) {
-  if (!g_db)
-    return;
-  NSString *basename =
-      [remotePath.lastPathComponent stringByDeletingPathExtension];
-  sqlite3_stmt *st = NULL;
-  // position = rank among existing rows with the same basename (1-based).
-  // ON CONFLICT: preserve position, only refresh unsignedHash and updateTime.
-  sqlite3_prepare_v2(
-      g_db,
-      "INSERT INTO tweaks (remotePath, basename, position, unsignedHash, updateTime)"
-      " VALUES (?, ?, (SELECT COALESCE(MAX(position), 0) + 1 FROM tweaks WHERE basename = ?), ?, ?)"
-      " ON CONFLICT(remotePath) DO UPDATE SET"
-      "   unsignedHash = excluded.unsignedHash,"
-      "   updateTime   = excluded.updateTime",
-      -1, &st, NULL);
-  sqlite3_bind_text(st, 1, remotePath.UTF8String, -1, SQLITE_TRANSIENT);
-  sqlite3_bind_text(st, 2, basename.UTF8String, -1, SQLITE_TRANSIENT);
-  sqlite3_bind_text(st, 3, basename.UTF8String, -1, SQLITE_TRANSIENT);
-  sqlite3_bind_blob(st, 4, unsignedHash.bytes, (int)unsignedHash.length, SQLITE_TRANSIENT);
-  sqlite3_bind_int64(st, 5, updateTime);
-  sqlite3_step(st);
-  sqlite3_finalize(st);
-}
-
 // ── All LiveContainer symbols resolved purely at runtime ──
 // No linker references — uses NSClassFromString / dlsym / objc_msgSend.
 // LCUtils is NOT available in the guest process, so we call ZSigner directly.
@@ -145,6 +25,12 @@ static void db_upsert(NSString *remotePath, NSData *unsignedHash,
 
 static BOOL signReceivedTweaks(NSArray<NSString *> *fileNames) {
   // Resolve LCSharedUtils (available in guest process)
+  if (fileNames.count == 0) {
+    debug_print(@"No tweaks to sign, skipping.");
+    return YES;
+  } else {
+    debug_print(@"Tweaks to sign: %@", fileNames);
+  }
   Class LCSharedUtils = NSClassFromString(@"LCSharedUtils");
   if (!LCSharedUtils) {
     debug_print(@"LCSharedUtils not found — not running inside "
@@ -374,6 +260,98 @@ static BOOL recv_exact(int sock, void *buf, size_t len) {
   return YES;
 }
 
+// ── SQLite tweak registry ─────────────────────────────────────────────────
+// Schema: PRIMARY KEY (basename, position), remotePath UNIQUE,
+//         unsignedHash BLOB, updateTime INTEGER
+//         local name = {basename}.{position}.{last8hexOfSha256}
+static sqlite3 *g_db = NULL;
+
+static void db_open(NSString *path) {
+  if (sqlite3_open(path.UTF8String, &g_db) != SQLITE_OK) {
+    debug_print(@"sqlite3_open failed: %s", sqlite3_errmsg(g_db));
+    g_db = NULL;
+    return;
+  }
+  const char *ddl = "CREATE TABLE IF NOT EXISTS tweaks ("
+                    "  remotePath     TEXT PRIMARY KEY,"
+                    "  basename       TEXT NOT NULL,"
+                    "  position       INTEGER NOT NULL," // rank among rows with same basename; local name = {basename}.{position}.{last8hexOfSha256}
+                    "  unsignedHash   BLOB NOT NULL,"
+                    "  updateTime     INTEGER NOT NULL"
+                    ")";
+  char *err = NULL;
+  if (sqlite3_exec(g_db, ddl, NULL, NULL, &err) != SQLITE_OK) {
+    debug_print(@"CREATE TABLE failed: %s", err);
+    sqlite3_free(err);
+  }
+}
+
+static NSString *derive_localName(NSString *remotePath, int position, NSData *unsignedHash) {
+  NSString *baseName = [remotePath.lastPathComponent stringByDeletingPathExtension];
+  const unsigned char *hashBytes = unsignedHash.bytes;
+  return [NSString stringWithFormat:@"%@.%d.%02x%02x%02x%02x.dylib",
+          baseName, position,
+          hashBytes[28], hashBytes[29], hashBytes[30], hashBytes[31]];
+}
+
+static NSString *db_lookup_localName(NSString *remotePath) {
+  // Format: {basename}.{position}.{last8hexOfSha256}.dylib
+  if (!g_db)
+    return nil;
+  NSString *baseName = [remotePath.lastPathComponent stringByDeletingPathExtension];
+  sqlite3_stmt *st = NULL;
+  sqlite3_prepare_v2(g_db,
+                     "SELECT position, unsignedHash FROM tweaks WHERE remotePath=? LIMIT 1",
+                     -1, &st, NULL);
+  sqlite3_bind_text(st, 1, remotePath.UTF8String, -1, SQLITE_TRANSIENT);
+  NSString *localName = nil;
+  if (sqlite3_step(st) == SQLITE_ROW) {
+    int position = sqlite3_column_int(st, 0);
+    const void *hashBytes = sqlite3_column_blob(st, 1);
+    int hashLen = sqlite3_column_bytes(st, 1);
+    if (hashBytes && hashLen == 32) {
+      NSData *unsignedHash = [NSData dataWithBytes:hashBytes length:hashLen];
+      localName = derive_localName(remotePath, position, unsignedHash);
+    }
+  }
+  sqlite3_finalize(st);
+  return localName;
+}
+
+static int db_upsert(NSString *remotePath, NSData *unsignedHash, int64_t updateTime) {
+  if (!g_db)
+    return -1;
+  NSString *basename =
+      [remotePath.lastPathComponent stringByDeletingPathExtension];
+  debug_print(@"Upserting into DB: remotePath=%s, baseName=%s", remotePath.UTF8String, basename.UTF8String);
+  sqlite3_stmt *st = NULL;
+  // position = rank among existing rows with the same basename (1-based).
+  // ON CONFLICT: preserve position, only refresh unsignedHash and updateTime.
+  sqlite3_prepare_v2(
+      g_db,
+      "INSERT INTO tweaks (remotePath, basename, position, unsignedHash, updateTime)"
+      " VALUES (?, ?, (SELECT COALESCE(MAX(position), 0) + 1 FROM tweaks WHERE basename=?), ?, ?)"
+      " ON CONFLICT(remotePath) DO UPDATE SET"
+      "   unsignedHash = excluded.unsignedHash,"
+      "   updateTime   = excluded.updateTime"
+      " RETURNING position",
+      -1, &st, NULL);
+  sqlite3_bind_text(st, 1, remotePath.UTF8String, -1, SQLITE_TRANSIENT);
+  sqlite3_bind_text(st, 2, basename.UTF8String, -1, SQLITE_TRANSIENT);
+  sqlite3_bind_text(st, 3, basename.UTF8String, -1, SQLITE_TRANSIENT);
+  sqlite3_bind_blob(st, 4, unsignedHash.bytes, (int)unsignedHash.length, SQLITE_TRANSIENT);
+  sqlite3_bind_int64(st, 5, updateTime);
+  int position = -1;
+  if (sqlite3_step(st) == SQLITE_ROW) {
+    position = sqlite3_column_int(st, 0);
+    debug_print(@"DB upsert successful: position=%d", position);
+  } else {
+    debug_print(@"DB upsert failed: %s", sqlite3_errmsg(g_db));
+  }
+  sqlite3_finalize(st);
+  return position;
+}
+
 BOOL recv_to_file(int sock, FILE *fp, size_t total_len) {
   char buffer[8192];
   size_t received_so_far = 0;
@@ -425,8 +403,9 @@ static void init() {
   NSString *containerPath = getActualContainerPath();
   NSString *tweaksDir =
       [containerPath stringByAppendingPathComponent:@"Documents/NetworkTweaks"];
+  NSString *downloadsDir = [tweaksDir stringByAppendingPathComponent:@".Downloads"];
   NSFileManager *fm = [NSFileManager defaultManager];
-  [fm createDirectoryAtPath:tweaksDir
+  [fm createDirectoryAtPath:downloadsDir
       withIntermediateDirectories:YES
                        attributes:nil
                             error:nil];
@@ -434,29 +413,38 @@ static void init() {
   db_open([tweaksDir stringByAppendingPathComponent:@"tweaks.db"]);
 
   // ── Phase 1: Receive manifest (name + sha256 + mtime per file) ──
-  NSMutableArray<NSString *> *allNames =
+  NSMutableArray<NSString *> *allRemotePaths =
+      [NSMutableArray arrayWithCapacity:dylib_count];
+  NSMutableArray<NSNumber *> *allPositions =
       [NSMutableArray arrayWithCapacity:dylib_count];
   NSMutableArray<NSData *> *allHashes =
       [NSMutableArray arrayWithCapacity:dylib_count];
   NSMutableArray<NSNumber *> *allRemoteTimes =
       [NSMutableArray arrayWithCapacity:dylib_count];
-  NSMutableArray<NSString *> *allPaths =
+  NSMutableArray<NSString *> *allDownloadPaths =
+      [NSMutableArray arrayWithCapacity:dylib_count];
+  NSMutableArray<NSString *> *allLocalNames =
+      [NSMutableArray arrayWithCapacity:dylib_count];
+  NSMutableArray<NSString *> *allOldLocalNames =
       [NSMutableArray arrayWithCapacity:dylib_count];
   // "{BaseName}.{last8hexOfSha256}" — deterministic from name+hash
   NSMutableArray<NSString *> *allUUIDs =
       [NSMutableArray arrayWithCapacity:dylib_count];
 
+  NSMutableSet<NSString *> *uniqueRemotePaths = [NSMutableSet setWithCapacity:dylib_count];
   NSMutableArray<NSNumber *> *neededIndices = [NSMutableArray array];
   NSUInteger networkLoaderIdx = NSNotFound;
 
   for (uint32_t i = 0; i < dylib_count; i++) {
+    BOOL needsDownload = NO;
     uint32_t name_len = 0;
     recv_exact(sock, &name_len, 4);
     char *name_buf = malloc(name_len + 1);
     recv_exact(sock, name_buf, name_len);
     name_buf[name_len] = '\0';
-    NSString *fileName = [NSString stringWithUTF8String:name_buf];
+    NSString *remotePath = [NSString stringWithUTF8String:name_buf];
     free(name_buf);
+    NSString *baseName = [remotePath.lastPathComponent stringByDeletingPathExtension];
 
     uint8_t hash_bytes[32];
     recv_exact(sock, hash_bytes, 32);
@@ -466,36 +454,72 @@ static void init() {
     recv_exact(sock, &remoteTs_net, 8);
     int64_t remoteTs = (int64_t)OSSwapBigToHostInt64(remoteTs_net);
 
-    [allNames addObject:fileName];
+    [allRemotePaths addObject:remotePath];
     [allHashes addObject:hash];
     [allRemoteTimes addObject:@(remoteTs)];
 
-    if ([fileName isEqualToString:@"NetworkLoader.dylib"])
+    if ([baseName isEqualToString:@"NetworkLoader"])
       networkLoaderIdx = i;
-
-    int64_t position = db_resolve_position(fileName);
-    NSString *uuid = makeLocalName(fileName, position, hash);
-    [allUUIDs addObject:uuid];
-
-    NSString *diskPath = [tweaksDir
-        stringByAppendingPathComponent:[uuid stringByAppendingString:@".dylib"]];
-    [allPaths addObject:diskPath];
-
-    // If this remotePath was previously stored under a different localName, remove the old file.
-    NSString *oldLocalName = db_lookup_localName(fileName);
-    NSString *localName = [uuid stringByAppendingString:@".dylib"];
-    if (oldLocalName && ![oldLocalName isEqualToString:localName]) {
-      NSString *oldPath = [tweaksDir stringByAppendingPathComponent:oldLocalName];
-      debug_print(@"%@: hash changed, removing old version %@", fileName, oldLocalName);
-      [fm removeItemAtPath:oldPath error:nil];
-    }
-
-    if (![fm fileExistsAtPath:diskPath]) {
-      debug_print(@"%@: missing", fileName);
-      [neededIndices addObject:@(i)];
+    
+    // Get position and localName from DB, derive expected local filename
+    int position = -1;
+    int64_t oldRemoteTs = 0;
+    sqlite3_stmt *st = NULL;
+    sqlite3_prepare_v2(g_db,
+                      "SELECT position, unsignedHash, updateTime FROM tweaks WHERE remotePath=? LIMIT 1",
+                      -1, &st, NULL);
+    sqlite3_bind_text(st, 1, remotePath.UTF8String, -1, SQLITE_TRANSIENT);
+    NSString *oldLocalName = nil;
+    NSData *oldUnsignedHash = nil;
+    if (sqlite3_step(st) == SQLITE_ROW) {
+      position = sqlite3_column_int(st, 0);
+      const void *hashBytes = sqlite3_column_blob(st, 1);
+      int hashLen = sqlite3_column_bytes(st, 1);
+      if (hashBytes && hashLen == 32) {
+        oldUnsignedHash = [NSData dataWithBytes:hashBytes length:hashLen];
+        oldLocalName = derive_localName(remotePath, position, oldUnsignedHash);
+        if (![oldUnsignedHash isEqualToData:hash]) {
+          debug_print(@"%@: hash changed", remotePath);
+          needsDownload = YES;
+        }
+      }
+      // compare update time
+      oldRemoteTs = sqlite3_column_int64(st, 2);
+      if (oldRemoteTs != remoteTs) {
+        debug_print(@"%@: remote timestamp changed (old: %lld, new: %lld)", remotePath, oldRemoteTs, remoteTs);
+        needsDownload = YES;
+      }
     } else {
-      debug_print(@"%@: up to date", fileName);
+      debug_print(@"%@: new entry, no existing local name", remotePath);
+      oldLocalName = @"";
+      needsDownload = YES;
     }
+    sqlite3_finalize(st);
+
+if ([uniqueRemotePaths containsObject:remotePath]) {
+      debug_print(@"WARNING: Duplicate remotePath in manifest: %@, index %u", remotePath, i);
+      needsDownload = NO;
+    } else {
+      [uniqueRemotePaths addObject:remotePath];
+    }
+
+    NSString *localName = derive_localName(remotePath, position, hash);
+    NSString *downloadPath = nil;
+    if (needsDownload) {
+      debug_print(@"%@: marked for download", remotePath);
+      [neededIndices addObject:@(i)];
+      downloadPath = [downloadsDir stringByAppendingPathComponent:[NSString stringWithFormat:@"%u.dylib", i]];
+    } else {
+      debug_print(@"%@: up to date, no download needed", remotePath);
+      downloadPath = [tweaksDir stringByAppendingPathComponent:localName];
+    }
+
+    debug_print(@"%@: local name = %@, old = %@, position = %d, download path = %@", remotePath, localName, oldLocalName, position, downloadPath);
+
+    [allLocalNames addObject:localName];
+    [allOldLocalNames addObject:oldLocalName];
+    [allPositions addObject:@(position)];
+    [allDownloadPaths addObject:downloadPath];
   }
 
   // Send needed indices to server
@@ -505,75 +529,108 @@ static void init() {
     uint32_t idx = htonl(n.unsignedIntValue);
     send(sock, &idx, 4, 0);
   }
-  debug_print(@"Requesting %lu/%u files…", (unsigned long)neededIndices.count,
-              dylib_count);
+  debug_print(@"Requesting %lu/%u files…", (unsigned long)neededIndices.count, dylib_count);
 
   // ── Phase 2: Receive only needed files ──
   NSMutableArray<NSString *> *receivedPaths = [NSMutableArray array];
   for (NSNumber *n in neededIndices) {
     uint32_t i = n.unsignedIntValue;
-    const char *path = [allPaths[i] UTF8String];
-
     uint32_t data_len = 0;
     recv_exact(sock, &data_len, 4);
     data_len = ntohl(data_len);
-    debug_print(@"#%u: receiving %@ (%u bytes)…", i, allNames[i], data_len);
+    debug_print(@"#%u: receiving %@ (%u bytes)…", i, allRemotePaths[i], data_len);
 
-    unlink(path);
-    FILE *fp = fopen(path, "wb");
+    FILE *fp = fopen([allDownloadPaths[i] UTF8String], "wb");
     if (!fp)
       exit(1);
     if (!recv_to_file(sock, fp, data_len)) {
-      debug_print(@"ERROR: Failed to receive %s", path);
+      debug_print(@"ERROR: Failed to receive %@", allDownloadPaths[i]);
       exit(1);
     }
     fclose(fp);
-
-    db_upsert(allNames[i], allHashes[i], [allRemoteTimes[i] longLongValue]);
-    [receivedPaths addObject:allPaths[i]];
+    [receivedPaths addObject:allDownloadPaths[i]];
   }
 
-  // ── Phase 3: Sign newly received tweaks ──
-  if (receivedPaths.count > 0) {
-    debug_print(@"Signing %lu tweaks…", (unsigned long)receivedPaths.count);
-    if (!signReceivedTweaks(receivedPaths)) {
-      debug_print(
-          @"WARNING: Signing failed — dlopen may fail on JIT-less setups.");
-    } else {
-      debug_print(@"Signing succeeded.");
-    }
+  if (receivedPaths.count != neededIndices.count) {
+    debug_print(@"ERROR: Expected to receive %lu files but got %lu",
+                (unsigned long)neededIndices.count, (unsigned long)receivedPaths.count);
+    exit(1);
+  }
+
+  if (!signReceivedTweaks(receivedPaths)) {
+    debug_print(@"ERROR: Failed to sign received tweaks");
+    exit(1);
   }
 
   // ── Phase 3.5: Copy NetworkLoader to LiveTweaks/ for next-boot pickup ──
   if (networkLoaderIdx != NSNotFound) {
-    NSString *liveTweaks = [containerPath
-        stringByAppendingPathComponent:@"Documents/Tweaks/LiveTweaks"];
-    [fm createDirectoryAtPath:liveTweaks
-        withIntermediateDirectories:YES
-                         attributes:nil
-                              error:nil];
-    NSString *dst =
-        [liveTweaks stringByAppendingPathComponent:@"NetworkLoader.dylib"];
+    NSString *liveTweaks = [containerPath stringByAppendingPathComponent:@"Documents/Tweaks/LiveTweaks"];
+    [fm createDirectoryAtPath:liveTweaks withIntermediateDirectories:YES attributes:nil error:nil];
+    NSString *dst = [liveTweaks stringByAppendingPathComponent:@"NetworkLoader.dylib"];
     [fm removeItemAtPath:dst error:nil];
     NSError *copyErr = nil;
-    if (![fm copyItemAtPath:allPaths[networkLoaderIdx] toPath:dst
-                     error:&copyErr]) {
+    if (![fm copyItemAtPath:allDownloadPaths[networkLoaderIdx] toPath:dst error:&copyErr]) {
       debug_print(@"Failed to copy NetworkLoader to LiveTweaks: %@", copyErr);
     } else {
       debug_print(@"NetworkLoader ready in LiveTweaks.");
     }
   }
 
-  // ── Phase 4: dlopen all tweaks ──
-  debug_print(@"Loading %u tweaks…", dylib_count);
-  for (uint32_t i = 0; i < dylib_count; i++) {
-    if ([allNames[i] isEqualToString:@"NetworkLoader.dylib"]) {
-      debug_print(@"Skipping self-reload");
+  BOOL loaderChanged = NO;
+
+  for (NSNumber *n in neededIndices) {
+    uint32_t i = n.unsignedIntValue;
+    if (i == networkLoaderIdx) {
+      loaderChanged = YES;
+    }
+    debug_print(@"Updating: %@", allDownloadPaths[i]);
+
+    // Delete old local file
+    if (allOldLocalNames[i]) {
+      unlink([tweaksDir stringByAppendingPathComponent:allOldLocalNames[i]].UTF8String);
+    }
+
+    // Update DB with new position, hash, and timestamp
+    int position = db_upsert(allRemotePaths[i], allHashes[i], [allRemoteTimes[i] longLongValue]);
+    allPositions[i] = @(position);
+
+    // Move received file into place (Downloads → Tweaks)
+    NSString *finalName = derive_localName(allRemotePaths[i], position, allHashes[i]);
+    NSString *finalPath = [tweaksDir stringByAppendingPathComponent:finalName];
+    debug_print(@"Moving %@ to tweaks as %@…", allDownloadPaths[i], finalName);
+    NSError *moveErr = nil;
+    if (![fm moveItemAtPath:allDownloadPaths[i] toPath:finalPath error:&moveErr]) {
+      debug_print(@"Move to tweaks failed: %@", moveErr);
       continue;
     }
-    const char *path = [allPaths[i] UTF8String];
+    allDownloadPaths[i] = finalPath;
+  }
+
+  // Remove downloads dir
+  [fm removeItemAtPath:downloadsDir error:nil];
+
+  if ((networkLoaderIdx != NSNotFound) && loaderChanged) {
+    debug_print(@"NetworkLoader was updated, switching to new version…");
+    dlopen([allDownloadPaths[networkLoaderIdx] UTF8String], RTLD_NOW | RTLD_GLOBAL);
+    return;
+  }
+
+  // ── Phase 4: dlopen all tweaks ──
+  NSMutableSet<NSString *> *loadedPaths = [NSMutableSet set];
+  debug_print(@"Loading %u tweaks…", dylib_count);
+  for (uint32_t i = 0; i < dylib_count; i++) {
+    if ([allRemotePaths[i] isEqualToString:@"NetworkLoader.dylib"]) {
+      //debug_print(@"Skipping self-reload");
+      continue;
+    }
+    if ([loadedPaths containsObject:allLocalNames[i]]) {
+      debug_print(@"Already loaded %@, skipping dlopen", allLocalNames[i]);
+      continue;
+    }
+    const char *path = [[tweaksDir stringByAppendingPathComponent:allLocalNames[i]]UTF8String];
     debug_print(@"Loading %s…", path);
     void *h = dlopen(path, RTLD_NOW | RTLD_GLOBAL);
+    [loadedPaths addObject:allLocalNames[i]];
     if (!h) {
       debug_print(@"[!] Failed to load %s: %s", path, dlerror());
       exit(1);
@@ -582,12 +639,10 @@ static void init() {
   }
   debug_print(@"Finished loading");
   dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
-    debug_print(@"Waiting for kill ping…");
+    debug_print(@"Waiting for kill ping or connection loss…");
     char monitor[1];
-    if (recv(sock, monitor, 1, 0) > 0) {
-      debug_print(@"Received kill ping");
-      abort();
-    }
+    recv(sock, monitor, 1, 0);
+    abort();
   });
 }
 
