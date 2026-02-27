@@ -22,6 +22,11 @@ static AVAudioFormat *g_format = nil;
 static AVAudioEngineManualRenderingBlock g_renderBlock = nil;
 static BOOL g_engineReady = NO;
 
+// The AudioUnit the engine was set up for. If a different unit is seen
+// (e.g. VoiceProcessingIO for calls vs RemoteIO for voice notes), we
+// tear down and rebuild so the format is detected fresh.
+static AudioUnit g_lastUnit = NULL;
+
 // Whether the mic buffer is float32 (YES) or int16 (NO).
 static BOOL g_micIsFloat = NO;
 
@@ -39,8 +44,9 @@ static void setupEngine(double sampleRate, UInt32 channels) {
     g_engine = [[AVAudioEngine alloc] init];
     g_pitchNode = [[AVAudioUnitTimePitch alloc] init];
     g_pitchNode.pitch = kPitchCents;
-    // overlap = 1 minimises priming latency (at the cost of some quality)
-    g_pitchNode.overlap = 1.0f;
+    // overlap = 8 gives natural-sounding pitch shift. Safe now that AVAudioSourceNode
+    // feeds data synchronously — no scheduling race to cause InsufficientDataFromInputNode.
+    g_pitchNode.overlap = 8.0f;
 
     g_format = [[AVAudioFormat alloc] initWithCommonFormat:AVAudioPCMFormatFloat32
                                                sampleRate:sampleRate
@@ -123,7 +129,17 @@ OSStatus hooked_AudioUnitRender(AudioUnit inUnit,
       if (inBusNumber != 1 || ioData == NULL) break;
       if (ioData->mNumberBuffers == 0 || ioData->mBuffers[0].mData == NULL) break;
 
-      if (!g_engineReady) {
+      if (!g_engineReady || inUnit != g_lastUnit) {
+          // Tear down existing engine so format is re-detected for this unit.
+          if (g_engine) {
+              [g_engine stop];
+              g_engine = nil;
+              g_pitchNode = nil;
+              g_sourceNode = nil;
+              g_renderBlock = nil;
+              g_engineReady = NO;
+          }
+          g_lastUnit = inUnit;
           detectAndSetup(inUnit);
       }
       if (!g_engineReady) break;
@@ -140,6 +156,7 @@ OSStatus hooked_AudioUnitRender(AudioUnit inUnit,
       }
 
       // Convert mic data to float32 for the pitch node.
+      
       if (g_micIsFloat) {
           memcpy(g_floatMicBuf, ioData->mBuffers[0].mData, frameCount * sizeof(float));
       } else {
@@ -171,9 +188,12 @@ OSStatus hooked_AudioUnitRender(AudioUnit inUnit,
               if (g_micIsFloat) {
                   memcpy(ioData->mBuffers[0].mData, out, outBuf.frameLength * sizeof(float));
               } else {
-                  // Float32 → Int16, scale back up
+                  // Clip to [-1, 1] first — phase vocoder can exceed 1.0, and
+                  // vDSP_vfix16 has undefined behaviour outside Int16 range.
+                  float clipLo = -1.0f, clipHi = 1.0f;
+                  vDSP_vclip(out, 1, &clipLo, &clipHi, g_floatMicBuf, 1, outBuf.frameLength);
                   float scale = 32768.0f;
-                  vDSP_vsmul(out, 1, &scale, g_floatMicBuf, 1, outBuf.frameLength);
+                  vDSP_vsmul(g_floatMicBuf, 1, &scale, g_floatMicBuf, 1, outBuf.frameLength);
                   vDSP_vfix16(g_floatMicBuf, 1, (int16_t *)ioData->mBuffers[0].mData, 1, outBuf.frameLength);
               }
           }
