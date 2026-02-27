@@ -26,6 +26,11 @@ for file in files:
     if file.suffix in ['.dylib', '.m', '.mm']:
         load_files.append(file)
 
+# NetworkLoader is always the first tweak — it needs sqlite3 and manages all others
+_nl = Path("tweaks/NetworkLoader.m")
+if _nl not in load_files:
+    load_files.insert(0, _nl)
+
 
 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 try:
@@ -152,7 +157,8 @@ with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                     m_file = Path(file.resolve())
                     if (not dylib_file.exists()) or (dylib_file.stat().st_mtime < max(max_mtime, m_file.stat().st_mtime)):
                         print(f"[*] Building {dylib_file} from {m_file}...")
-                        os.system(f"bash scripts/compile {m_file}")
+                        env = "CLANG_EXTRA_LINKS=sqlite3 " if file.name == "NetworkLoader.m" else ""
+                        os.system(f"{env}bash scripts/compile {m_file}")
                 elif file.suffix == ".dylib":
                     dylib_file = file
                 else:
@@ -161,16 +167,18 @@ with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                     data = f.read()
                 name = os.path.basename(dylib_file).encode()
                 sha256 = hashlib.sha256(data).digest()
-                file_infos.append((name, sha256, data))
+                mtime = int(dylib_file.stat().st_mtime)
+                file_infos.append((name, sha256, mtime, data))
                 print(f"[*] {dylib_file.name}: {len(data)} bytes, sha256={sha256.hex()[:16]}…")
 
-            # Send READY + manifest (count, then name+sha256 per file)
+            # Send READY + manifest (count, then name+sha256+mtime per file)
             conn.sendall(b"READY\n")
             conn.sendall(struct.pack('!I', len(file_infos)))
-            for name, sha256, _ in file_infos:
+            for name, sha256, mtime, _ in file_infos:
                 conn.sendall(struct.pack('<I', len(name)))
                 conn.sendall(name)
-                conn.sendall(sha256)  # 32 bytes
+                conn.sendall(sha256)          # 32 bytes
+                conn.sendall(struct.pack('!Q', mtime))  # 8 bytes big-endian
 
             # Receive list of indices the iPhone still needs
             needed_count = struct.unpack('!I', recv_exact(conn, 4))[0]
@@ -182,7 +190,7 @@ with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
 
             # Send only the requested files
             for idx in needed_indices:
-                name, _, data = file_infos[idx]
+                name, _, __, data = file_infos[idx]
                 print(f"[*] Sending {name.decode()} ({len(data)} bytes)...")
                 conn.sendall(struct.pack('!I', len(data)))
                 conn.sendall(data)

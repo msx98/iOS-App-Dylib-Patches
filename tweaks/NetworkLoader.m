@@ -1,8 +1,10 @@
 #import <Foundation/Foundation.h>
 #import <arpa/inet.h>
 #import <dlfcn.h>
+#import <libkern/OSByteOrder.h>
 #import <netinet/in.h>
 #import <os/log.h>
+#import <sqlite3.h>
 #import <sys/socket.h>
 #import <unistd.h>
 
@@ -10,6 +12,63 @@
 #import <objc/runtime.h>
 
 #import "../lib/utils/utils.m"
+
+// ── SQLite tweak registry ─────────────────────────────────────────────────
+// Schema: remotePath TEXT PK, uuid TEXT UNIQUE, sha256 BLOB,
+//         remoteUpdatedAt INTEGER, localUpdatedAt INTEGER
+static sqlite3 *g_db = NULL;
+
+static void db_open(NSString *path) {
+  if (sqlite3_open(path.UTF8String, &g_db) != SQLITE_OK) {
+    debug_print(@"sqlite3_open failed: %s", sqlite3_errmsg(g_db));
+    g_db = NULL;
+    return;
+  }
+  const char *ddl = "CREATE TABLE IF NOT EXISTS tweaks ("
+                    "  remotePath     TEXT PRIMARY KEY,"
+                    "  uuid           TEXT NOT NULL UNIQUE,"
+                    "  sha256         BLOB NOT NULL,"
+                    "  remoteUpdatedAt INTEGER,"
+                    "  localUpdatedAt  INTEGER"
+                    ")";
+  char *err = NULL;
+  if (sqlite3_exec(g_db, ddl, NULL, NULL, &err) != SQLITE_OK) {
+    debug_print(@"CREATE TABLE failed: %s", err);
+    sqlite3_free(err);
+  }
+}
+
+// Derive a human-readable, hash-stable UUID: "BaseName.aabbccdd"
+// where the last 8 hex chars are the final 4 bytes of the sha256.
+// A new hash → a new filename, so existence at the path is sufficient
+// to determine whether the file is already downloaded and signed.
+static NSString *makeUUID(NSString *remotePath, NSData *sha256) {
+  const uint8_t *b = (const uint8_t *)sha256.bytes;
+  NSString *tail = [NSString stringWithFormat:@"%02x%02x%02x%02x",
+                    b[28], b[29], b[30], b[31]];
+  NSString *base = [remotePath.lastPathComponent stringByDeletingPathExtension];
+  return [NSString stringWithFormat:@"%@.%@", base, tail];
+}
+
+static void db_upsert(NSString *remotePath, NSString *uuid, NSData *sha256,
+                      int64_t remoteTs, int64_t localTs) {
+  if (!g_db)
+    return;
+  sqlite3_stmt *st = NULL;
+  sqlite3_prepare_v2(
+      g_db,
+      "INSERT OR REPLACE INTO tweaks"
+      " (remotePath, uuid, sha256, remoteUpdatedAt, localUpdatedAt)"
+      " VALUES (?,?,?,?,?)",
+      -1, &st, NULL);
+  sqlite3_bind_text(st, 1, remotePath.UTF8String, -1, SQLITE_TRANSIENT);
+  sqlite3_bind_text(st, 2, uuid.UTF8String, -1, SQLITE_TRANSIENT);
+  sqlite3_bind_blob(st, 3, sha256.bytes, (int)sha256.length, SQLITE_TRANSIENT);
+  sqlite3_bind_int64(st, 4, remoteTs);
+  sqlite3_bind_int64(st, 5, localTs);
+  sqlite3_step(st);
+  sqlite3_finalize(st);
+}
 
 // ── All LiveContainer symbols resolved purely at runtime ──
 // No linker references — uses NSClassFromString / dlsym / objc_msgSend.
@@ -283,20 +342,8 @@ static void init() {
   struct sockaddr_in addr;
   addr.sin_family = AF_INET;
   addr.sin_port = htons(8887);
-  NSLog(@"[NetworkLoader] Connecting to controller 2 at %s:8887…",
-        CONTROLLER_IP.UTF8String);
-  os_log(OS_LOG_DEFAULT, "[NetworkLoader] Controller IP 2: %{public}s",
-         CONTROLLER_IP.UTF8String);
   getControllerIP();
-  NSLog(@"[NetworkLoader] Connecting to controller 2 at %s:8887…",
-        CONTROLLER_IP.UTF8String);
-  os_log(OS_LOG_DEFAULT, "[NetworkLoader] Controller IP 2: %{public}s",
-         CONTROLLER_IP.UTF8String);
-  // NSLog(@"[NetworkLoader] Controller IP: %s", CONTROLLER_IP.UTF8String); //
-  // shows controller IP as "private"
-
-  NSLog(@"[NetworkLoader] Controller IP 3: %@",
-        CONTROLLER_IP); // shows controller
+  NSLog(@"[NetworkLoader] Controller IP: %@", CONTROLLER_IP);
   addr.sin_addr.s_addr = inet_addr(CONTROLLER_IP.UTF8String);
 
   if (connect(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0)
@@ -312,82 +359,82 @@ static void init() {
   dylib_count = ntohl(dylib_count);
   debug_print(@"Manifest: %u dylibs", dylib_count);
 
-  NSString *basePath = [getActualContainerPath()
-      stringByAppendingPathComponent:@"Documents/Tweaks/LiveTweaks"];
-  NSString *loadPath = [basePath stringByAppendingPathComponent:@"Load"];
+  NSString *containerPath = getActualContainerPath();
+  NSString *tweaksDir =
+      [containerPath stringByAppendingPathComponent:@"Documents/NetworkTweaks"];
   NSFileManager *fm = [NSFileManager defaultManager];
-  [fm createDirectoryAtPath:[basePath stringByAppendingPathComponent:@"0"]
-      withIntermediateDirectories:YES
-                       attributes:nil
-                            error:nil];
-  [fm createDirectoryAtPath:loadPath
+  [fm createDirectoryAtPath:tweaksDir
       withIntermediateDirectories:YES
                        attributes:nil
                             error:nil];
 
-  // ── Phase 1: Receive manifest (name + sha256 per file) ──
+  // Purge Load/ — LiveContainer auto-loads everything there, but we handle all
+  // loading via dlopen. Only LiveTweaks/NetworkLoader.dylib should be
+  // auto-loaded by LiveContainer; everything else goes through us.
+  NSString *loadDir = [containerPath
+      stringByAppendingPathComponent:@"Documents/Tweaks/LiveTweaks/Load"];
+  for (NSString *f in [fm contentsOfDirectoryAtPath:loadDir error:nil] ?: @[]) {
+    [fm removeItemAtPath:[loadDir stringByAppendingPathComponent:f] error:nil];
+  }
+
+  db_open([tweaksDir stringByAppendingPathComponent:@"tweaks.db"]);
+
+  // ── Phase 1: Receive manifest (name + sha256 + mtime per file) ──
   NSMutableArray<NSString *> *allNames =
-      [NSMutableArray arrayWithCapacity:dylib_count];
-  NSMutableArray<NSString *> *allPaths =
       [NSMutableArray arrayWithCapacity:dylib_count];
   NSMutableArray<NSData *> *allHashes =
       [NSMutableArray arrayWithCapacity:dylib_count];
+  NSMutableArray<NSNumber *> *allRemoteTimes =
+      [NSMutableArray arrayWithCapacity:dylib_count];
+  NSMutableArray<NSString *> *allPaths =
+      [NSMutableArray arrayWithCapacity:dylib_count];
+  // "{BaseName}.{last8hexOfSha256}" — deterministic from name+hash
+  NSMutableArray<NSString *> *allUUIDs =
+      [NSMutableArray arrayWithCapacity:dylib_count];
+
+  NSMutableArray<NSNumber *> *neededIndices = [NSMutableArray array];
+  NSUInteger networkLoaderIdx = NSNotFound;
 
   for (uint32_t i = 0; i < dylib_count; i++) {
     uint32_t name_len = 0;
     recv_exact(sock, &name_len, 4);
-    // name_len is little-endian ('<I') — no swap needed on LE arch
     char *name_buf = malloc(name_len + 1);
     recv_exact(sock, name_buf, name_len);
     name_buf[name_len] = '\0';
+    NSString *fileName = [NSString stringWithUTF8String:name_buf];
+    free(name_buf);
 
     uint8_t hash_bytes[32];
     recv_exact(sock, hash_bytes, 32);
+    NSData *hash = [NSData dataWithBytes:hash_bytes length:32];
 
-    NSString *fileName = [NSString stringWithUTF8String:name_buf];
-    free(name_buf);
-    NSString *fullPath =
-        [fileName isEqualToString:@"NetworkLoader.dylib"]
-            ? [[basePath stringByAppendingPathComponent:@"0"]
-                  stringByAppendingPathComponent:fileName]
-            : [loadPath stringByAppendingPathComponent:fileName];
+    uint64_t remoteTs_net = 0;
+    recv_exact(sock, &remoteTs_net, 8);
+    int64_t remoteTs = (int64_t)OSSwapBigToHostInt64(remoteTs_net);
 
     [allNames addObject:fileName];
-    [allPaths addObject:fullPath];
-    [allHashes addObject:[NSData dataWithBytes:hash_bytes length:32]];
-  }
+    [allHashes addObject:hash];
+    [allRemoteTimes addObject:@(remoteTs)];
 
-  // Delete files in Load/ that are no longer in the manifest (+ their sidecars)
-  NSArray<NSString *> *existing =
-      [fm contentsOfDirectoryAtPath:loadPath error:nil] ?: @[];
-  NSSet<NSString *> *manifestNames = [NSSet setWithArray:allNames];
-  for (NSString *name in existing) {
-    if ([name hasSuffix:@".sha256"])
-      continue; // handled with their dylib
-    if (![manifestNames containsObject:name]) {
-      debug_print(@"Removing stale: %@", name);
-      [fm removeItemAtPath:[loadPath stringByAppendingPathComponent:name]
-                     error:nil];
-      [fm removeItemAtPath:[loadPath
-                               stringByAppendingPathComponent:
-                                   [name stringByAppendingString:@".sha256"]]
-                     error:nil];
-    }
-  }
+    if ([fileName isEqualToString:@"NetworkLoader.dylib"])
+      networkLoaderIdx = i;
 
-  // Determine which files are missing or whose pre-signing hash has changed
-  NSMutableArray<NSNumber *> *neededIndices = [NSMutableArray array];
-  for (uint32_t i = 0; i < dylib_count; i++) {
-    NSString *sidecar = [allPaths[i] stringByAppendingString:@".sha256"];
-    NSData *stored = [NSData dataWithContentsOfFile:sidecar];
-    if (!stored || ![stored isEqualToData:allHashes[i]]) {
-      debug_print(@"%@: %@", allNames[i],
-                  stored ? @"hash mismatch" : @"missing");
+    NSString *uuid = makeUUID(fileName, hash);
+    [allUUIDs addObject:uuid];
+
+    NSString *diskPath = [tweaksDir
+        stringByAppendingPathComponent:[uuid stringByAppendingString:@".dylib"]];
+    [allPaths addObject:diskPath];
+
+    if (![fm fileExistsAtPath:diskPath]) {
+      debug_print(@"%@: missing", fileName);
       [neededIndices addObject:@(i)];
     } else {
-      debug_print(@"%@: up to date", allNames[i]);
+      debug_print(@"%@: up to date", fileName);
     }
   }
+
+  // Stale tweaks (in DB but absent from manifest) are left on disk — not loaded.
 
   // Send needed indices to server
   uint32_t needed_count = htonl((uint32_t)neededIndices.count);
@@ -412,17 +459,17 @@ static void init() {
 
     unlink(path);
     FILE *fp = fopen(path, "wb");
-    if (!fp) {
+    if (!fp)
       exit(1);
-    }
     if (!recv_to_file(sock, fp, data_len)) {
       debug_print(@"ERROR: Failed to receive %s", path);
       exit(1);
     }
     fclose(fp);
-    // Persist the pre-signing hash so we can skip re-downloading on next run
-    NSString *sidecar = [allPaths[i] stringByAppendingString:@".sha256"];
-    [allHashes[i] writeToFile:sidecar atomically:YES];
+
+    int64_t localTs = (int64_t)[[NSDate date] timeIntervalSince1970];
+    db_upsert(allNames[i], allUUIDs[i], allHashes[i],
+              [allRemoteTimes[i] longLongValue], localTs);
     [receivedPaths addObject:allPaths[i]];
   }
 
@@ -434,6 +481,26 @@ static void init() {
           @"WARNING: Signing failed — dlopen may fail on JIT-less setups.");
     } else {
       debug_print(@"Signing succeeded.");
+    }
+  }
+
+  // ── Phase 3.5: Copy NetworkLoader to LiveTweaks/ for next-boot pickup ──
+  if (networkLoaderIdx != NSNotFound) {
+    NSString *liveTweaks = [containerPath
+        stringByAppendingPathComponent:@"Documents/Tweaks/LiveTweaks"];
+    [fm createDirectoryAtPath:liveTweaks
+        withIntermediateDirectories:YES
+                         attributes:nil
+                              error:nil];
+    NSString *dst =
+        [liveTweaks stringByAppendingPathComponent:@"NetworkLoader.dylib"];
+    [fm removeItemAtPath:dst error:nil];
+    NSError *copyErr = nil;
+    if (![fm copyItemAtPath:allPaths[networkLoaderIdx] toPath:dst
+                     error:&copyErr]) {
+      debug_print(@"Failed to copy NetworkLoader to LiveTweaks: %@", copyErr);
+    } else {
+      debug_print(@"NetworkLoader ready in LiveTweaks.");
     }
   }
 
