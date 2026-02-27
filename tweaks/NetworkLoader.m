@@ -14,8 +14,9 @@
 #import "../lib/utils/utils.m"
 
 // ── SQLite tweak registry ─────────────────────────────────────────────────
-// Schema: remotePath TEXT PK, uuid TEXT UNIQUE, sha256 BLOB,
-//         remoteUpdatedAt INTEGER, localUpdatedAt INTEGER
+// Schema: PRIMARY KEY (basename, position), remotePath UNIQUE,
+//         unsignedHash BLOB, updateTime INTEGER
+//         local name = {basename}.{position}.{last8hexOfSha256}
 static sqlite3 *g_db = NULL;
 
 static void db_open(NSString *path) {
@@ -25,11 +26,12 @@ static void db_open(NSString *path) {
     return;
   }
   const char *ddl = "CREATE TABLE IF NOT EXISTS tweaks ("
-                    "  remotePath     TEXT PRIMARY KEY,"
-                    "  uuid           TEXT NOT NULL UNIQUE,"
-                    "  sha256         BLOB NOT NULL,"
-                    "  remoteUpdatedAt INTEGER,"
-                    "  localUpdatedAt  INTEGER"
+                    "  basename       TEXT    NOT NULL,"
+                    "  position       INTEGER NOT NULL," // rank among rows with same basename; local name = {basename}.{position}.{last8hexOfSha256}
+                    "  remotePath     TEXT    NOT NULL UNIQUE,"
+                    "  unsignedHash   BLOB    NOT NULL,"
+                    "  updateTime     INTEGER NOT NULL,"
+                    "  PRIMARY KEY (basename, position)"
                     ")";
   char *err = NULL;
   if (sqlite3_exec(g_db, ddl, NULL, NULL, &err) != SQLITE_OK) {
@@ -38,34 +40,95 @@ static void db_open(NSString *path) {
   }
 }
 
-// Derive a human-readable, hash-stable UUID: "BaseName.aabbccdd"
-// where the last 8 hex chars are the final 4 bytes of the sha256.
-// A new hash → a new filename, so existence at the path is sufficient
-// to determine whether the file is already downloaded and signed.
-static NSString *makeUUID(NSString *remotePath, NSData *sha256) {
+// Local name format: "{basename}.{position}.{last8hexOfSha256}"
+static NSString *makeLocalName(NSString *remotePath, int64_t position,
+                               NSData *sha256) {
   const uint8_t *b = (const uint8_t *)sha256.bytes;
   NSString *tail = [NSString stringWithFormat:@"%02x%02x%02x%02x",
                     b[28], b[29], b[30], b[31]];
   NSString *base = [remotePath.lastPathComponent stringByDeletingPathExtension];
-  return [NSString stringWithFormat:@"%@.%@", base, tail];
+  return [NSString stringWithFormat:@"%@.%lld.%@", base, (long long)position,
+                   tail];
 }
 
-static void db_upsert(NSString *remotePath, NSString *uuid, NSData *sha256,
-                      int64_t remoteTs, int64_t localTs) {
+// Returns the stored position for an existing row, or the next available rank
+// for a new one (MAX(position)+1 among rows with the same basename).
+static int64_t db_resolve_position(NSString *remotePath) {
   if (!g_db)
-    return;
+    return 1;
+  sqlite3_stmt *st = NULL;
+  sqlite3_prepare_v2(g_db,
+                     "SELECT position FROM tweaks WHERE remotePath=? LIMIT 1",
+                     -1, &st, NULL);
+  sqlite3_bind_text(st, 1, remotePath.UTF8String, -1, SQLITE_TRANSIENT);
+  int64_t pos = 0;
+  if (sqlite3_step(st) == SQLITE_ROW)
+    pos = sqlite3_column_int64(st, 0);
+  sqlite3_finalize(st);
+  if (pos > 0)
+    return pos;
+  // New row: next rank for this basename.
+  NSString *base = [remotePath.lastPathComponent stringByDeletingPathExtension];
+  sqlite3_prepare_v2(
+      g_db, "SELECT COALESCE(MAX(position), 0) + 1 FROM tweaks WHERE basename=?",
+      -1, &st, NULL);
+  sqlite3_bind_text(st, 1, base.UTF8String, -1, SQLITE_TRANSIENT);
+  pos = 1;
+  if (sqlite3_step(st) == SQLITE_ROW)
+    pos = sqlite3_column_int64(st, 0);
+  sqlite3_finalize(st);
+  return pos;
+}
+
+// Reconstruct the local name for a stored row, or nil if not found.
+static NSString *db_lookup_localName(NSString *remotePath) {
+  if (!g_db)
+    return nil;
   sqlite3_stmt *st = NULL;
   sqlite3_prepare_v2(
       g_db,
-      "INSERT OR REPLACE INTO tweaks"
-      " (remotePath, uuid, sha256, remoteUpdatedAt, localUpdatedAt)"
-      " VALUES (?,?,?,?,?)",
+      "SELECT basename, position, unsignedHash FROM tweaks WHERE remotePath=? LIMIT 1",
       -1, &st, NULL);
   sqlite3_bind_text(st, 1, remotePath.UTF8String, -1, SQLITE_TRANSIENT);
-  sqlite3_bind_text(st, 2, uuid.UTF8String, -1, SQLITE_TRANSIENT);
-  sqlite3_bind_blob(st, 3, sha256.bytes, (int)sha256.length, SQLITE_TRANSIENT);
-  sqlite3_bind_int64(st, 4, remoteTs);
-  sqlite3_bind_int64(st, 5, localTs);
+  NSString *localName = nil;
+  if (sqlite3_step(st) == SQLITE_ROW) {
+    const char *base = (const char *)sqlite3_column_text(st, 0);
+    int64_t pos = sqlite3_column_int64(st, 1);
+    const uint8_t *b = (const uint8_t *)sqlite3_column_blob(st, 2);
+    int len = sqlite3_column_bytes(st, 2);
+    if (base && b && len >= 32) {
+      NSString *tail = [NSString stringWithFormat:@"%02x%02x%02x%02x",
+                        b[28], b[29], b[30], b[31]];
+      localName = [NSString stringWithFormat:@"%s.%lld.%@", base,
+                             (long long)pos, tail];
+    }
+  }
+  sqlite3_finalize(st);
+  return localName;
+}
+
+static void db_upsert(NSString *remotePath, NSData *unsignedHash,
+                      int64_t updateTime) {
+  if (!g_db)
+    return;
+  NSString *basename =
+      [remotePath.lastPathComponent stringByDeletingPathExtension];
+  sqlite3_stmt *st = NULL;
+  // position = rank among existing rows with the same basename (1-based).
+  // ON CONFLICT: preserve position, only refresh unsignedHash and updateTime.
+  sqlite3_prepare_v2(
+      g_db,
+      "INSERT INTO tweaks (remotePath, basename, position, unsignedHash, updateTime)"
+      " VALUES (?, ?, (SELECT COALESCE(MAX(position), 0) + 1 FROM tweaks WHERE basename = ?), ?, ?)"
+      " ON CONFLICT(remotePath) DO UPDATE SET"
+      "   unsignedHash = excluded.unsignedHash,"
+      "   updateTime   = excluded.updateTime",
+      -1, &st, NULL);
+  sqlite3_bind_text(st, 1, remotePath.UTF8String, -1, SQLITE_TRANSIENT);
+  sqlite3_bind_text(st, 2, basename.UTF8String, -1, SQLITE_TRANSIENT);
+  sqlite3_bind_text(st, 3, basename.UTF8String, -1, SQLITE_TRANSIENT);
+  sqlite3_bind_blob(st, 4, unsignedHash.bytes, (int)unsignedHash.length, SQLITE_TRANSIENT);
+  sqlite3_bind_int64(st, 5, updateTime);
   sqlite3_step(st);
   sqlite3_finalize(st);
 }
@@ -368,15 +431,6 @@ static void init() {
                        attributes:nil
                             error:nil];
 
-  // Purge Load/ — LiveContainer auto-loads everything there, but we handle all
-  // loading via dlopen. Only LiveTweaks/NetworkLoader.dylib should be
-  // auto-loaded by LiveContainer; everything else goes through us.
-  NSString *loadDir = [containerPath
-      stringByAppendingPathComponent:@"Documents/Tweaks/LiveTweaks/Load"];
-  for (NSString *f in [fm contentsOfDirectoryAtPath:loadDir error:nil] ?: @[]) {
-    [fm removeItemAtPath:[loadDir stringByAppendingPathComponent:f] error:nil];
-  }
-
   db_open([tweaksDir stringByAppendingPathComponent:@"tweaks.db"]);
 
   // ── Phase 1: Receive manifest (name + sha256 + mtime per file) ──
@@ -419,12 +473,22 @@ static void init() {
     if ([fileName isEqualToString:@"NetworkLoader.dylib"])
       networkLoaderIdx = i;
 
-    NSString *uuid = makeUUID(fileName, hash);
+    int64_t position = db_resolve_position(fileName);
+    NSString *uuid = makeLocalName(fileName, position, hash);
     [allUUIDs addObject:uuid];
 
     NSString *diskPath = [tweaksDir
         stringByAppendingPathComponent:[uuid stringByAppendingString:@".dylib"]];
     [allPaths addObject:diskPath];
+
+    // If this remotePath was previously stored under a different localName, remove the old file.
+    NSString *oldLocalName = db_lookup_localName(fileName);
+    NSString *localName = [uuid stringByAppendingString:@".dylib"];
+    if (oldLocalName && ![oldLocalName isEqualToString:localName]) {
+      NSString *oldPath = [tweaksDir stringByAppendingPathComponent:oldLocalName];
+      debug_print(@"%@: hash changed, removing old version %@", fileName, oldLocalName);
+      [fm removeItemAtPath:oldPath error:nil];
+    }
 
     if (![fm fileExistsAtPath:diskPath]) {
       debug_print(@"%@: missing", fileName);
@@ -433,8 +497,6 @@ static void init() {
       debug_print(@"%@: up to date", fileName);
     }
   }
-
-  // Stale tweaks (in DB but absent from manifest) are left on disk — not loaded.
 
   // Send needed indices to server
   uint32_t needed_count = htonl((uint32_t)neededIndices.count);
@@ -467,9 +529,7 @@ static void init() {
     }
     fclose(fp);
 
-    int64_t localTs = (int64_t)[[NSDate date] timeIntervalSince1970];
-    db_upsert(allNames[i], allUUIDs[i], allHashes[i],
-              [allRemoteTimes[i] longLongValue], localTs);
+    db_upsert(allNames[i], allHashes[i], [allRemoteTimes[i] longLongValue]);
     [receivedPaths addObject:allPaths[i]];
   }
 
