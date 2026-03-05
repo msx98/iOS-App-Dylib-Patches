@@ -24,6 +24,7 @@
     "files.associations": {
         "*.m": "objective-c"
     },
+    "editor.formatOnSave": false,
     "files.exclude": {
         "**/.git": true,
         "**/.svn": true,

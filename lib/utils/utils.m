@@ -64,13 +64,14 @@ static NSString *getControllerIP() {
   // without hardcoding an IP in the tweak.
   if (!CONTROLLER_IP) {
     NSString *ipFilePath = [getDocumentsPath()
-        stringByAppendingPathComponent:@"Tweaks/controller_ip.txt"];
+        stringByAppendingPathComponent:@"NetworkTweaks/controller_ip.db"];
     BOOL file_exists =
         [[NSFileManager defaultManager] fileExistsAtPath:ipFilePath];
-    NSArray<NSString *> *subdirContents = [[NSFileManager defaultManager]
-        contentsOfDirectoryAtPath:[getActualContainerPath()
-                                      stringByDeletingLastPathComponent]
-                            error:nil];
+    if (!file_exists) {
+      os_log(OS_LOG_DEFAULT, "Controller IP file not found: %{public}s",
+             ipFilePath.UTF8String);
+      return nil;
+    }
     CONTROLLER_IP = [NSString stringWithContentsOfFile:ipFilePath
                                               encoding:NSUTF8StringEncoding
                                                  error:nil];
