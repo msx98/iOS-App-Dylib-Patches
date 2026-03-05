@@ -139,7 +139,74 @@ static void swizzled_captureOutput(id self, SEL _cmd, AVCaptureOutput *output, C
     }
 }
 
+static CGImageRef loadSpoofCGImage() {
+    NSString *dir = [getDocumentsPath() stringByAppendingPathComponent:@"TweakConfigs/CameraSpoof"];
+    NSArray *supported = @[@"png", @"PNG", @"jpg", @"JPG", @"jpeg", @"JPEG"];
+    for (NSString *ext in supported) {
+        for (NSString *file in [[NSFileManager defaultManager] contentsOfDirectoryAtPath:dir error:nil]) {
+            if ([file.pathExtension.lowercaseString isEqualToString:ext.lowercaseString]) {
+                NSString *imagePath = [dir stringByAppendingPathComponent:file];
+                CGDataProviderRef provider = CGDataProviderCreateWithFilename(imagePath.UTF8String);
+                if (!provider) return NULL;
+                CGImageRef img = [ext.lowercaseString isEqualToString:@"png"]
+                    ? CGImageCreateWithPNGDataProvider(provider, NULL, true, kCGRenderingIntentDefault)
+                    : CGImageCreateWithJPEGDataProvider(provider, NULL, true, kCGRenderingIntentDefault);
+                CGDataProviderRelease(provider);
+                return img; // caller must CGImageRelease
+            }
+        }
+    }
+    return NULL;
+}
+
+static void hookPreviewLayer() {
+    Class cls = [AVCaptureVideoPreviewLayer class];
+
+    // Hook initWithSession: to add the overlay sublayer
+    SEL initSel = @selector(initWithSession:);
+    Method initM = class_getInstanceMethod(cls, initSel);
+    if (!initM) return;
+
+    __block IMP initOrig = method_getImplementation(initM);
+    method_setImplementation(initM, imp_implementationWithBlock(^AVCaptureVideoPreviewLayer *(AVCaptureVideoPreviewLayer *self, AVCaptureSession *session) {
+        AVCaptureVideoPreviewLayer *result = ((AVCaptureVideoPreviewLayer *(*)(id, SEL, id))initOrig)(self, initSel, session);
+
+        CGImageRef cgImage = loadSpoofCGImage();
+        if (!cgImage) return result;
+
+        CALayer *overlay = [CALayer layer];
+        overlay.name = @"CameraSpoofOverlay";
+        overlay.contents = (__bridge id)cgImage;
+        overlay.contentsGravity = kCAGravityResizeAspectFill;
+        overlay.masksToBounds = YES;
+        overlay.frame = result.bounds; // updated in layoutSublayers
+        [result addSublayer:overlay];
+        CGImageRelease(cgImage);
+
+        return result;
+    }));
+
+    // Hook layoutSublayers to keep overlay filling the layer after layout
+    SEL layoutSel = @selector(layoutSublayers);
+    Method layoutM = class_getInstanceMethod(cls, layoutSel);
+    __block IMP layoutOrig = layoutM ? method_getImplementation(layoutM) : NULL;
+    IMP newLayoutImp = imp_implementationWithBlock(^(CALayer *self) {
+        if (layoutOrig) ((void(*)(id, SEL))layoutOrig)(self, layoutSel);
+        for (CALayer *sub in self.sublayers) {
+            if ([sub.name isEqualToString:@"CameraSpoofOverlay"]) {
+                sub.frame = self.bounds;
+            }
+        }
+    });
+    if (layoutM) {
+        method_setImplementation(layoutM, newLayoutImp);
+    } else {
+        class_addMethod(cls, layoutSel, newLayoutImp, "v@:");
+    }
+}
+
 static void init() {
+    hookPreviewLayer();
     Method m = class_getInstanceMethod([AVCaptureVideoDataOutput class], @selector(setSampleBufferDelegate:queue:));
     if (!m) return;
     
