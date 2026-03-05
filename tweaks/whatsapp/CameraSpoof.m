@@ -1,15 +1,75 @@
-com.kdt.livecontainer.2UW67KF476
-
 #import <Foundation/Foundation.h>
 #import <AVFoundation/AVFoundation.h>
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <objc/message.h> // Required for objc_msgSend
 
+#include "../../lib/utils/utils.m"
+
 /**
  * CameraSpoof.m - Fixed Compiler Errors
  * Procedural Pink + White Line Pattern
  */
+
+ CVPixelBufferRef loadBufferFromImage(size_t width, size_t height) {
+    NSString *dir = [getDocumentsPath() stringByAppendingPathComponent:@"TweakConfigs/CameraSpoof"];
+    NSArray *supported = @[@"png", @"PNG", @"jpg", @"JPG", @"jpeg", @"JPEG"];
+    NSString *imagePath = nil;
+    for (NSString *ext in supported) {
+        NSArray *matches = [[NSFileManager defaultManager]
+            contentsOfDirectoryAtPath:dir error:nil];
+        for (NSString *file in matches) {
+            if ([file.pathExtension.lowercaseString isEqualToString:ext.lowercaseString]) {
+                imagePath = [dir stringByAppendingPathComponent:file];
+                break;
+            }
+        }
+        if (imagePath) break;
+    }
+    if (!imagePath) {
+        os_log(OS_LOG_DEFAULT, "Camera spoof: no image found in %{public}s", dir.UTF8String);
+        return NULL;
+    }
+
+    CGDataProviderRef provider = CGDataProviderCreateWithFilename(imagePath.UTF8String);
+    if (!provider) return NULL;
+
+    NSString *ext = imagePath.pathExtension.lowercaseString;
+    CGImageRef cgImage = [ext isEqualToString:@"png"]
+        ? CGImageCreateWithPNGDataProvider(provider, NULL, true, kCGRenderingIntentDefault)
+        : CGImageCreateWithJPEGDataProvider(provider, NULL, true, kCGRenderingIntentDefault);
+    CGDataProviderRelease(provider);
+    if (!cgImage) return NULL;
+
+    NSDictionary *options = @{
+        (id)kCVPixelBufferCGImageCompatibilityKey: @YES,
+        (id)kCVPixelBufferCGBitmapContextCompatibilityKey: @YES
+    };
+
+    CVPixelBufferRef pxbuffer = NULL;
+    CVReturn status = CVPixelBufferCreate(kCFAllocatorDefault, width, height,
+                                         kCVPixelFormatType_32BGRA,
+                                         (__bridge CFDictionaryRef)options,
+                                         &pxbuffer);
+    if (status != kCVReturnSuccess) { CGImageRelease(cgImage); return NULL; }
+
+    CVPixelBufferLockBaseAddress(pxbuffer, 0);
+    void *baseAddress = CVPixelBufferGetBaseAddress(pxbuffer);
+    size_t bytesPerRow = CVPixelBufferGetBytesPerRow(pxbuffer);
+
+    CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
+    CGContextRef context = CGBitmapContextCreate(baseAddress, width, height, 8, bytesPerRow,
+                                                 colorSpace,
+                                                 kCGBitmapByteOrder32Little | kCGImageAlphaPremultipliedFirst);
+    // Draw image scaled to the target dimensions (matching the camera frame)
+    CGContextDrawImage(context, CGRectMake(0, 0, width, height), cgImage);
+    CGContextRelease(context);
+    CGColorSpaceRelease(colorSpace);
+    CGImageRelease(cgImage);
+
+    CVPixelBufferUnlockBaseAddress(pxbuffer, 0);
+    return pxbuffer;
+ }
 
 static CVPixelBufferRef spoofBuffer = NULL;
 
@@ -49,7 +109,13 @@ CVPixelBufferRef createPinkBuffer(int width, int height) {
 
 static void swizzled_captureOutput(id self, SEL _cmd, AVCaptureOutput *output, CMSampleBufferRef sampleBuffer, AVCaptureConnection *connection) {
     if (spoofBuffer == NULL) {
-        spoofBuffer = createPinkBuffer(1280, 720);
+        CVPixelBufferRef incomingPixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer);
+        size_t w = incomingPixelBuffer ? CVPixelBufferGetWidth(incomingPixelBuffer) : 1280;
+        size_t h = incomingPixelBuffer ? CVPixelBufferGetHeight(incomingPixelBuffer) : 720;
+        spoofBuffer = loadBufferFromImage(w, h);
+        if (!spoofBuffer) {
+            spoofBuffer = createPinkBuffer((int)w, (int)h);
+        }
     }
 
     if (spoofBuffer != NULL) {
@@ -73,7 +139,6 @@ static void swizzled_captureOutput(id self, SEL _cmd, AVCaptureOutput *output, C
     }
 }
 
-__attribute__((constructor))
 static void init() {
     Method m = class_getInstanceMethod([AVCaptureVideoDataOutput class], @selector(setSampleBufferDelegate:queue:));
     if (!m) return;
@@ -97,3 +162,5 @@ static void init() {
         ((void(*)(id, SEL, id, dispatch_queue_t))orig)(self, @selector(setSampleBufferDelegate:queue:), delegate, queue);
     }));
 }
+
+INITIALIZE("CameraSpoof")
