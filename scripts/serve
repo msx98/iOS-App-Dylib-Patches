@@ -3,9 +3,9 @@
 from typing import Tuple, Dict
 import socket
 import select
+import subprocess
 from dotenv import dotenv_values
 import sys
-import os
 import glob
 import hashlib
 from collections import defaultdict
@@ -28,7 +28,7 @@ for file in files:
         load_files.append(file)
 
 # NetworkLoader is always the first tweak — it needs sqlite3 and manages all others
-_nl = Path("tweaks/NetworkLoader.m")
+_nl = Path("src/tweaks/NetworkLoader.m")
 if _nl not in load_files:
     load_files.insert(0, _nl)
 
@@ -131,15 +131,54 @@ def recv_exact(conn, n):
     return buf
 
 
+cmake_build_dir = "build-cmake"
+if not Path(cmake_build_dir, "CMakeCache.txt").exists():
+    print(f"[*] Configuring CMake build in {cmake_build_dir}...")
+    result = subprocess.run(["cmake", "-S", ".", "-B", cmake_build_dir], capture_output=True, text=True)
+    if result.returncode != 0:
+        print(f"ERROR: CMake configure failed:\n{result.stderr}")
+        exit(1)
+
+def compile_necessary_files():
+    failed = False
+    file_infos = []
+    max_mtime = max((f.stat().st_mtime for f in Path("src").glob("*") if f.is_file()), default=0)
+    for file in load_files:
+        if file.suffix in [".m", ".mm"]:
+            dylib_file = Path("build") / file.with_suffix('.dylib').name
+            target = file.stem
+            if (not dylib_file.exists()) or (dylib_file.stat().st_mtime < max(max_mtime, file.stat().st_mtime)):
+                print(f"[*] Building {dylib_file} via cmake target '{target}'...")
+                result = subprocess.run(
+                    #["cmake", "--build", cmake_build_dir, "--target", target],
+                    ["scripts/compile", file],
+                    capture_output=True, text=True
+                )
+                if result.returncode != 0:
+                    print(f"ERROR: Failed to build {target}:\n{result.stderr}")
+                    failed = True
+                    continue
+        elif file.suffix == ".dylib":
+            dylib_file = file
+        else:
+            continue
+        with open(dylib_file, 'rb') as f:
+            data = f.read()
+        #name = os.path.basename(dylib_file).encode()
+        name = str(file.resolve()).encode()
+        sha256 = hashlib.sha256(data).digest()
+        mtime = int(dylib_file.stat().st_mtime)
+        file_infos.append((name, sha256, mtime, data))
+        print(f"[*] {dylib_file.name}: {len(data)} bytes, sha256={sha256.hex()[:16]}…")
+    return file_infos, failed
+
+
 with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
     t = LogThread()
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     s.bind(('0.0.0.0', DYLIB_PORT))
     s.listen(8)
     t.start()
-
-    utils_dir = Path("lib/utils")
-    max_mtime = max((f.stat().st_mtime for f in utils_dir.glob("*") if f.is_file()), default=0)
 
     print(f"[*] DYLIB Waiting for iPhone connections on tcp://{ip_addr}:{DYLIB_PORT}...")
     conns = []
@@ -149,37 +188,11 @@ with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             conn, addr = s.accept()
             conns.append(conn)
             print(f"[*] Connected by {addr}")
-            import subprocess
 
             # Build all dylibs and compute their hashes upfront
-            failed = False
-            file_infos = []  # list of (name_bytes, sha256_bytes, data_bytes)
-            for file in load_files:
-                if file.suffix in [".m", ".mm"]:
-                    dylib_file = Path("build") / file.with_suffix('.dylib').name
-                    dotenv_file = file.with_suffix('.env')
-                    m_file = Path(file.resolve())
-                    if (not dylib_file.exists()) or (dylib_file.stat().st_mtime < max(max_mtime, m_file.stat().st_mtime)):
-                        print(f"[*] Building {dylib_file} from {m_file}...")
-                        #env_vars = dotenv_values(dotenv_file) if dotenv_file.exists() else {}
-                        result = subprocess.run(["bash", "scripts/compile", str(m_file)], capture_output=True, text=True, env={**os.environ, })#**env_vars})
-                        if result.returncode != 0:
-                            print(f"ERROR: Failed to compile {m_file}:\n{result.stderr}")
-                            failed = True
-                            continue
-                elif file.suffix == ".dylib":
-                    dylib_file = file
-                else:
-                    continue
-                with open(dylib_file, 'rb') as f:
-                    data = f.read()
-                #name = os.path.basename(dylib_file).encode()
-                name = str(file.resolve()).encode()
-                sha256 = hashlib.sha256(data).digest()
-                mtime = int(dylib_file.stat().st_mtime)
-                file_infos.append((name, sha256, mtime, data))
-                print(f"[*] {dylib_file.name}: {len(data)} bytes, sha256={sha256.hex()[:16]}…")
+            # Ensure CMake build directory is configured
 
+            file_infos, failed = compile_necessary_files()
             if failed:
                 print("[*] Build failed for one or more files. Not sending anything to the iPhone.")
                 conn.sendall(b"ERROR\n")

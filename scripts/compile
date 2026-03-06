@@ -4,6 +4,8 @@ SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path)
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" &> /dev/null && pwd -P)
 REPO_ROOT="${SCRIPT_DIR}/.."
 
+cd "$REPO_ROOT"
+
 compile_file() {
 	set -e
 	local FILE="$1"
@@ -33,13 +35,15 @@ compile_file() {
 	if [ -f "$FILE_DOTENV" ]; then eval "$(cat $FILE_DOTENV)"; fi
 	EXTRA_FLAGS=${EXTRA_FLAGS:-""}
 	EXTRA_FLAGS="$EXTRA_FLAGS $EXTRA_FLAGS_ARGS"
-	OUTPUT_DIR=${OUTPUT_DIR:-"$REPO_ROOT/build"}
+	OUTPUT_DIR=${OUTPUT_DIR:-"build"}
 	OUTPUT_PATH=${OUTPUT_PATH:-""}
 	CLANG_LINKS=${CLANG_LINKS:-""}
-	CLANG_INCLUDES=${CLANG_INCLUDES:-"$REPO_ROOT/lib $REPO_ROOT/lib/fishhook $REPO_ROOT/lib/utils"}
-	CLANG_SOURCES=${CLANG_SOURCES:-"$REPO_ROOT/lib/fishhook/fishhook.c"}
+	CLANG_INCLUDES=${CLANG_INCLUDES:-"src"}
+	CLANG_SYSTEM_INCLUDES=${CLANG_SYSTEM_INCLUDES:-""}
+	CLANG_SOURCES=${CLANG_SOURCES:-"src/submodules/fishhook/fishhook.c"}
 	CLANG_FRAMEWORKS=${CLANG_FRAMEWORKS:-"CoreAudio AVFoundation CoreMedia CoreVideo AudioToolbox UIKit Foundation"}
 	CLANG_INCLUDES="$CLANG_INCLUDES $CLANG_EXTRA_INCLUDES"
+	CLANG_SYSTEM_INCLUDES="$CLANG_SYSTEM_INCLUDES $CLANG_EXTRA_SYSTEM_INCLUDES"
 	CLANG_SOURCES="$CLANG_SOURCES $CLANG_EXTRA_SOURCES"
 	CLANG_FRAMEWORKS="$CLANG_FRAMEWORKS $CLANG_EXTRA_FRAMEWORKS"
 	CLANG_LINKS="$CLANG_LINKS $CLANG_EXTRA_LINKS"
@@ -49,11 +53,14 @@ compile_file() {
 		OUTPUT_PATH="$OUTPUT_DIR/$NAME.dylib"
 	fi
 
-	FLAGS=("-dynamiclib" "-arch" "arm64" "-isysroot" "$SDK_PATH")
+	FLAGS=("-dynamiclib" "-arch" "arm64" "-isysroot" "$SDK_PATH" "-fobjc-arc")
 
 	# 2. Append includes (properly quoted)
 	for INCLUDE in $CLANG_INCLUDES; do
 		FLAGS+=("-I" "$INCLUDE")
+	done
+	for INCLUDE in $CLANG_SYSTEM_INCLUDES; do
+		FLAGS+=("-isystem" "$INCLUDE")
 	done
 
 	# 3. Append frameworks

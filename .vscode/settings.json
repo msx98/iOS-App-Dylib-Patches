@@ -1,29 +1,24 @@
 {
     //"explorer.excludeGitIgnore": true,
-    "C_Cpp.default.includePath": [
-        "/usr/include/**",
-        "/usr/local/include/**",
-        "${workspaceFolder}/lib",
-        "${workspaceFolder}/lib/LiveContainer",
-        "${workspaceFolder}/lib/fishhook",
-        "${workspaceFolder}/lib/utils",
-    ],
+    "cmake.cmakePath": "/opt/homebrew/bin/cmake",
     "clang.objcflags": [
-        "-I${workspaceFolder}/lib",
-        "-I${workspaceFolder}/lib/LiveContainer",
-        "-I${workspaceFolder}/lib/fishhook",
-        "-I${workspaceFolder}/lib/utils",
+        "-fobjc-arc",
+        "-I", "src",
+        "-isysroot/Applications/Xcode.app/Contents/Developer/Platforms/iPhoneOS.platform/Developer/SDKs/iPhoneOS.sdk",
+    ],
+    "C_Cpp.default.includePath": [
+        "${workspaceFolder}/src",
     ],
     "C_Cpp.default.systemIncludePath": [
-        "${workspaceFolder}/lib",
-        "${workspaceFolder}/lib/utils",
-        "${workspaceFolder}/lib/fishhook",
-        "${workspaceFolder}/lib/LiveContainer",
-        "lib",
+        "/Applications/Xcode.app/Contents/Developer/Platforms/iPhoneOS.platform/Developer/SDKs/iPhoneOS.sdk/usr/include",
+        "/Applications/Xcode.app/Contents/Developer/Platforms/iPhoneOS.platform/Developer/SDKs/iPhoneOS.sdk/System/Library/Frameworks",
     ],
     "files.associations": {
-        "*.m": "objective-c"
+        "*.m": "objective-c",
+        "*.mm": "objective-cpp",
+        "*.h": "objective-c"
     },
+    "swift.sourcekit-lsp.disable": false,
     "editor.formatOnSave": false,
     "files.exclude": {
         "**/.git": true,
@@ -31,6 +26,8 @@
         "**/.hg": true,
         "**/.DS_Store": true,
         "**/Thumbs.db": true,
+        "**/build": true,
+        "build-cmake": true,
         ".keys": true,
         ".secrets": true,
     }

@@ -1,1 +1,1 @@
-scripts/serve tweaks/telegram/DisableSiriINPreferences.m tweaks/whatsapp/WhatsAppDisableSiriEntitlement.m tweaks/telegram/SpoofCloudKit.m $@
+scripts/serve src/tweaks/telegram/DisableSiriINPreferences.m src/tweaks/whatsapp/WhatsAppDisableSiriEntitlement.m src/tweaks/telegram/SpoofCloudKit.m $@

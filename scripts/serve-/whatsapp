@@ -1,1 +1,1 @@
-scripts/serve tweaks/whatsapp/WhatsAppDisableSiriEntitlement.m $@
+scripts/serve src/tweaks/whatsapp/WhatsAppDisableSiriEntitlement.m $@

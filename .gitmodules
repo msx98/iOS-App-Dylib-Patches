@@ -1,9 +1,9 @@
-[submodule "fishhook"]
-	path = lib/fishhook
+[submodule "submodules/fishhook"]
+	path = src/submodules/fishhook
 	url = https://github.com/facebook/fishhook.git
-[submodule "LiveContainer"]
-	path = lib/LiveContainer
-	url = git@github.com:LiveContainer/LiveContainer.git
-[submodule "lib/Dobby"]
-	path = lib/Dobby
+[submodule "submodules/Dobby"]
+	path = src/submodules/Dobby
 	url = git@github.com:jmpews/Dobby.git
+[submodule "submodules/LiveContainer"]
+	path = src/submodules/LiveContainer
+	url = git@github.com:LiveContainer/LiveContainer.git

@@ -1,17 +1,8 @@
 CompileFlags:
   Add:
-    - -I./lib
-    - -I./lib/utils
-    - -I./lib/fishhook
-    - -I./lib/LiveContainer
-    - -Ilib
-    - -Ilib/utils
-    - -x
-    - objective-c
+    - -Isrc
     - -fobjc-arc
-    - -fmodules
     - -target
     - arm64-apple-ios26.3
     - -isysroot
     - /Applications/Xcode.app/Contents/Developer/Platforms/iPhoneOS.platform/Developer/SDKs/iPhoneOS.sdk
-    - -F/Applications/Xcode.app/Contents/Developer/Platforms/iPhoneOS.platform/Developer/SDKs/iPhoneOS.sdk/System/Library/Frameworks
