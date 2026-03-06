@@ -161,8 +161,8 @@ with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                     m_file = Path(file.resolve())
                     if (not dylib_file.exists()) or (dylib_file.stat().st_mtime < max(max_mtime, m_file.stat().st_mtime)):
                         print(f"[*] Building {dylib_file} from {m_file}...")
-                        env_vars = dotenv_values(dotenv_file) if dotenv_file.exists() else {}
-                        result = subprocess.run(["bash", "scripts/compile", str(m_file)], capture_output=True, text=True, env={**os.environ, **env_vars})
+                        #env_vars = dotenv_values(dotenv_file) if dotenv_file.exists() else {}
+                        result = subprocess.run(["bash", "scripts/compile", str(m_file)], capture_output=True, text=True, env={**os.environ, })#**env_vars})
                         if result.returncode != 0:
                             print(f"ERROR: Failed to compile {m_file}:\n{result.stderr}")
                             failed = True
