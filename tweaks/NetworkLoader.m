@@ -272,7 +272,7 @@ static void db_open(NSString *path) {
     g_db = NULL;
     return;
   }
-  const char *ddl = "CREATE TABLE IF NOT EXISTS tweaks ("
+  const char *create_tweaks_query = "CREATE TABLE IF NOT EXISTS tweaks ("
                     "  remotePath     TEXT PRIMARY KEY,"
                     "  basename       TEXT NOT NULL,"
                     "  position       INTEGER NOT NULL," // rank among rows with same basename; local name = {basename}.{position}.{last8hexOfSha256}
@@ -280,15 +280,23 @@ static void db_open(NSString *path) {
                     "  updateTime     INTEGER NOT NULL"
                     ")";
   char *err = NULL;
-  if (sqlite3_exec(g_db, ddl, NULL, NULL, &err) != SQLITE_OK) {
+  if (sqlite3_exec(g_db, create_tweaks_query, NULL, NULL, &err) != SQLITE_OK) {
     debug_print(@"CREATE TABLE failed: %s", err);
     sqlite3_free(err);
   }
+  /*
+  const char *create_config_query = "CREATE TABLE IF NOT EXISTS appConfig ("
+                    "  packageId      TEXT,"
+                    "  containerId    TEXT,"
+                    "  loggerIp       TEXT," // taken from Documents/LiveTweaks/ip.txt for new apps
+                    "  remotePaths    ARRAY[TEXT],"
+                    "  updateTime     INTEGER" // 
+                    */
 }
 
 static NSString *derive_localName(NSString *remotePath, int position, NSData *unsignedHash) {
   NSString *baseName = [remotePath.lastPathComponent stringByDeletingPathExtension];
-  const unsigned char *hashBytes = unsignedHash.bytes;
+  const unsigned char *hashBytes = (unsigned char*) unsignedHash.bytes;
   return [NSString stringWithFormat:@"%@.%d.%02x%02x%02x%02x.dylib",
           baseName, position,
           hashBytes[28], hashBytes[29], hashBytes[30], hashBytes[31]];
@@ -439,7 +447,7 @@ static void init() {
     BOOL needsDownload = NO;
     uint32_t name_len = 0;
     recv_exact(sock, &name_len, 4);
-    char *name_buf = malloc(name_len + 1);
+    char *name_buf = (char*) malloc(sizeof(char) * (name_len + 1));
     recv_exact(sock, name_buf, name_len);
     name_buf[name_len] = '\0';
     NSString *remotePath = [NSString stringWithUTF8String:name_buf];
@@ -458,8 +466,7 @@ static void init() {
     [allHashes addObject:hash];
     [allRemoteTimes addObject:@(remoteTs)];
 
-    if ([baseName isEqualToString:@"NetworkLoader"])
-      networkLoaderIdx = i;
+    if ([baseName isEqualToString:@"NetworkLoader"]) networkLoaderIdx = i;
     
     // Get position and localName from DB, derive expected local filename
     int position = -1;

@@ -1,6 +1,7 @@
 #import <Foundation/Foundation.h>
 #import <AVFoundation/AVFoundation.h>
 #import <UIKit/UIKit.h>
+#import <CoreImage/CoreImage.h>
 #import <objc/runtime.h>
 #import <objc/message.h> // Required for objc_msgSend
 
@@ -11,7 +12,7 @@
  * Procedural Pink + White Line Pattern
  */
 
- CVPixelBufferRef loadBufferFromImage(size_t width, size_t height) {
+ CVPixelBufferRef loadBufferFromImage(size_t width, size_t height, OSType pixelFormat) {
     NSString *dir = [getDocumentsPath() stringByAppendingPathComponent:@"TweakConfigs/CameraSpoof"];
     NSArray *supported = @[@"png", @"PNG", @"jpg", @"JPG", @"jpeg", @"JPEG"];
     NSString *imagePath = nil;
@@ -43,31 +44,29 @@
 
     NSDictionary *options = @{
         (id)kCVPixelBufferCGImageCompatibilityKey: @YES,
-        (id)kCVPixelBufferCGBitmapContextCompatibilityKey: @YES
+        (id)kCVPixelBufferCGBitmapContextCompatibilityKey: @YES,
+        (id)kCVPixelBufferIOSurfacePropertiesKey: @{}
     };
 
     CVPixelBufferRef pxbuffer = NULL;
     CVReturn status = CVPixelBufferCreate(kCFAllocatorDefault, width, height,
-                                         kCVPixelFormatType_32BGRA,
+                                         pixelFormat,
                                          (__bridge CFDictionaryRef)options,
                                          &pxbuffer);
     if (status != kCVReturnSuccess) { CGImageRelease(cgImage); return NULL; }
 
-    CVPixelBufferLockBaseAddress(pxbuffer, 0);
-    void *baseAddress = CVPixelBufferGetBaseAddress(pxbuffer);
-    size_t bytesPerRow = CVPixelBufferGetBytesPerRow(pxbuffer);
-
-    CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
-    CGContextRef context = CGBitmapContextCreate(baseAddress, width, height, 8, bytesPerRow,
-                                                 colorSpace,
-                                                 kCGBitmapByteOrder32Little | kCGImageAlphaPremultipliedFirst);
-    // Draw image scaled to the target dimensions (matching the camera frame)
-    CGContextDrawImage(context, CGRectMake(0, 0, width, height), cgImage);
-    CGContextRelease(context);
-    CGColorSpaceRelease(colorSpace);
+    // CIContext handles BGRA→YUV (and any other format) conversion automatically
+    CIImage *ciImage = [CIImage imageWithCGImage:cgImage];
     CGImageRelease(cgImage);
 
-    CVPixelBufferUnlockBaseAddress(pxbuffer, 0);
+    // Scale to fill the target rect
+    CGFloat scaleX = (CGFloat)width  / ciImage.extent.size.width;
+    CGFloat scaleY = (CGFloat)height / ciImage.extent.size.height;
+    ciImage = [ciImage imageByApplyingTransform:CGAffineTransformMakeScale(scaleX, scaleY)];
+
+    CIContext *ciCtx = [CIContext contextWithOptions:nil];
+    [ciCtx render:ciImage toCVPixelBuffer:pxbuffer];
+
     return pxbuffer;
  }
 
@@ -112,31 +111,29 @@ static void swizzled_captureOutput(id self, SEL _cmd, AVCaptureOutput *output, C
         CVPixelBufferRef incomingPixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer);
         size_t w = incomingPixelBuffer ? CVPixelBufferGetWidth(incomingPixelBuffer) : 1280;
         size_t h = incomingPixelBuffer ? CVPixelBufferGetHeight(incomingPixelBuffer) : 720;
-        spoofBuffer = loadBufferFromImage(w, h);
+        OSType fmt = incomingPixelBuffer ? CVPixelBufferGetPixelFormatType(incomingPixelBuffer) : kCVPixelFormatType_32BGRA;
+        spoofBuffer = loadBufferFromImage(w, h, fmt);
         if (!spoofBuffer) {
             spoofBuffer = createPinkBuffer((int)w, (int)h);
         }
     }
 
+    SEL origSel = sel_registerName("original_captureOutput:didOutputSampleBuffer:fromConnection:");
+    void (*msgSendFunc)(id, SEL, id, CMSampleBufferRef, id) = (void (*)(id, SEL, id, CMSampleBufferRef, id))objc_msgSend;
+
+    CMSampleBufferRef fakeBuffer = NULL;
     if (spoofBuffer != NULL) {
-        CMSampleBufferRef fakeBuffer = NULL;
         CMSampleTimingInfo timingInfo;
         CMSampleBufferGetSampleTimingInfo(sampleBuffer, 0, &timingInfo);
-        
         CMVideoFormatDescriptionRef formatDesc = NULL;
         CMVideoFormatDescriptionCreateForImageBuffer(kCFAllocatorDefault, spoofBuffer, &formatDesc);
-        
         CMSampleBufferCreateForImageBuffer(kCFAllocatorDefault, spoofBuffer, YES, NULL, NULL, formatDesc, &timingInfo, &fakeBuffer);
-        
-        SEL origSel = sel_registerName("original_captureOutput:didOutputSampleBuffer:fromConnection:");
-        
-        // Explicitly cast objc_msgSend to prevent the "undeclared" or "strict prototype" errors
-        void (*msgSendFunc)(id, SEL, id, CMSampleBufferRef, id) = (void (*)(id, SEL, id, CMSampleBufferRef, id))objc_msgSend;
-        msgSendFunc(self, origSel, output, fakeBuffer, connection);
-        
-        if (fakeBuffer) CFRelease(fakeBuffer);
         if (formatDesc) CFRelease(formatDesc);
     }
+
+    // Fall back to original buffer if spoof buffer creation failed — keeps video timer running
+    msgSendFunc(self, origSel, output, fakeBuffer ?: sampleBuffer, connection);
+    if (fakeBuffer) CFRelease(fakeBuffer);
 }
 
 static CGImageRef loadSpoofCGImage() {
@@ -205,29 +202,121 @@ static void hookPreviewLayer() {
     }
 }
 
+static void hookAVCapturePhotoMethods() {
+    Class cls = NSClassFromString(@"AVCapturePhoto");
+    if (!cls) return;
+
+    // --- pixelBuffer ---
+    {
+        SEL sel = @selector(pixelBuffer);
+        Method m = class_getInstanceMethod(cls, sel);
+        if (m) {
+            __block IMP orig = method_getImplementation(m);
+            method_setImplementation(m, imp_implementationWithBlock(^CVPixelBufferRef(id self) {
+                static const void *kKey = &kKey;
+                id cached = objc_getAssociatedObject(self, kKey);
+                if (cached) return (__bridge CVPixelBufferRef)cached;
+                CVPixelBufferRef original = ((CVPixelBufferRef(*)(id, SEL))orig)(self, sel);
+                size_t w = original ? CVPixelBufferGetWidth(original)  : 4032;
+                size_t h = original ? CVPixelBufferGetHeight(original) : 3024;
+                OSType fmt = original ? CVPixelBufferGetPixelFormatType(original) : kCVPixelFormatType_32BGRA;
+                CVPixelBufferRef spoof = loadBufferFromImage(w, h, fmt);
+                if (!spoof) return original;
+                id holder = CFBridgingRelease(spoof);
+                objc_setAssociatedObject(self, kKey, holder, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                return (__bridge CVPixelBufferRef)holder;
+            }));
+        }
+    }
+
+    // --- cgImageRepresentation ---
+    {
+        SEL sel = @selector(cgImageRepresentation);
+        Method m = class_getInstanceMethod(cls, sel);
+        if (m) {
+            method_setImplementation(m, imp_implementationWithBlock(^CGImageRef(id self) {
+                static const void *kKey = &kKey;
+                id cached = objc_getAssociatedObject(self, kKey);
+                if (cached) return (__bridge CGImageRef)cached;
+                CGImageRef img = loadSpoofCGImage();
+                if (!img) return NULL;
+                id holder = CFBridgingRelease(img);
+                objc_setAssociatedObject(self, kKey, holder, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                return (__bridge CGImageRef)holder;
+            }));
+        }
+    }
+
+    // --- fileDataRepresentation (JPEG bytes - what most apps actually use) ---
+    {
+        SEL sel = @selector(fileDataRepresentation);
+        Method m = class_getInstanceMethod(cls, sel);
+        if (m) {
+            method_setImplementation(m, imp_implementationWithBlock(^NSData *(id self) {
+                static const void *kKey = &kKey;
+                NSData *cached = objc_getAssociatedObject(self, kKey);
+                if (cached) return cached;
+                CGImageRef img = loadSpoofCGImage();
+                if (!img) return NULL;
+                NSMutableData *data = [NSMutableData data];
+                CGImageDestinationRef dest = CGImageDestinationCreateWithData(
+                    (__bridge CFMutableDataRef)data,
+                    (__bridge CFStringRef)@"public.jpeg", 1, NULL);
+                if (dest) {
+                    CGImageDestinationAddImage(dest, img, NULL);
+                    CGImageDestinationFinalize(dest);
+                    CFRelease(dest);
+                }
+                CGImageRelease(img);
+                if (!data.length) return NULL;
+                objc_setAssociatedObject(self, kKey, data, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                return data;
+            }));
+        }
+    }
+}
+
+static void swizzleCaptureDelegate(id delegate) {
+    if (!delegate) return;
+    Class cls = [delegate class];
+    SEL targetSel = @selector(captureOutput:didOutputSampleBuffer:fromConnection:);
+    SEL origSel = sel_registerName("original_captureOutput:didOutputSampleBuffer:fromConnection:");
+    if (!class_getInstanceMethod(cls, origSel)) {
+        Method origM = class_getInstanceMethod(cls, targetSel);
+        if (origM) {
+            class_addMethod(cls, origSel, method_getImplementation(origM), method_getTypeEncoding(origM));
+            method_setImplementation(origM, (IMP)swizzled_captureOutput);
+        }
+    }
+}
+
 static void init() {
     hookPreviewLayer();
+    hookAVCapturePhotoMethods();
+
+    // Hook setSampleBufferDelegate:queue: to catch delegates set after dylib load
     Method m = class_getInstanceMethod([AVCaptureVideoDataOutput class], @selector(setSampleBufferDelegate:queue:));
-    if (!m) return;
-    
-    __block IMP orig = method_getImplementation(m);
-    method_setImplementation(m, imp_implementationWithBlock(^(AVCaptureVideoDataOutput *self, id delegate, dispatch_queue_t queue) {
-        if (delegate) {
-            Class cls = [delegate class];
-            SEL targetSel = @selector(captureOutput:didOutputSampleBuffer:fromConnection:);
-            SEL origSel = sel_registerName("original_captureOutput:didOutputSampleBuffer:fromConnection:");
-            
-            if (!class_getInstanceMethod(cls, origSel)) {
-                Method origM = class_getInstanceMethod(cls, targetSel);
-                if (origM) {
-                    class_addMethod(cls, origSel, method_getImplementation(origM), method_getTypeEncoding(origM));
-                    method_setImplementation(origM, (IMP)swizzled_captureOutput);
+    if (m) {
+        __block IMP orig = method_getImplementation(m);
+        method_setImplementation(m, imp_implementationWithBlock(^(AVCaptureVideoDataOutput *self, id delegate, dispatch_queue_t queue) {
+            swizzleCaptureDelegate(delegate);
+            ((void(*)(id, SEL, id, dispatch_queue_t))orig)(self, @selector(setSampleBufferDelegate:queue:), delegate, queue);
+        }));
+    }
+
+    // Hook AVCaptureSession startRunning to catch delegates already set before dylib load (e.g. Telegram)
+    Method startM = class_getInstanceMethod([AVCaptureSession class], @selector(startRunning));
+    if (startM) {
+        __block IMP startOrig = method_getImplementation(startM);
+        method_setImplementation(startM, imp_implementationWithBlock(^(AVCaptureSession *self) {
+            for (AVCaptureOutput *output in self.outputs) {
+                if ([output isKindOfClass:[AVCaptureVideoDataOutput class]]) {
+                    swizzleCaptureDelegate(((AVCaptureVideoDataOutput *)output).sampleBufferDelegate);
                 }
             }
-        }
-        // Original call
-        ((void(*)(id, SEL, id, dispatch_queue_t))orig)(self, @selector(setSampleBufferDelegate:queue:), delegate, queue);
-    }));
+            ((void(*)(id, SEL))startOrig)(self, @selector(startRunning));
+        }));
+    }
 }
 
 INITIALIZE("CameraSpoof")

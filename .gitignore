@@ -1,4 +1,7 @@
 build
+research
+*.bak
+*.bkp
 .keys
 .secrets
 *.p12

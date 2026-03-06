@@ -14,8 +14,21 @@ compile_file() {
 	fi
 
 	FILE_NO_SUFFIX="${FILE%.*}"
+	FILE_EXTENSION="${FILE##*.}"
 	NAME=$(basename "$FILE_NO_SUFFIX")
 	FILE_DOTENV="${FILE_NO_SUFFIX}.env"
+	
+	if [ "$FILE_EXTENSION" == "m" ]; then
+		COMPILER="clang"
+	elif [ "$FILE_EXTENSION" == "mm" ]; then
+		COMPILER="clang++"
+	elif [ "$FILE_EXTENSION" == "dylib" ]; then
+		echo "Error: $FILE is already a dylib. Skipping compilation."
+		return 0
+	else
+		echo "Error: Unsupported file extension for $FILE"
+		exit 1
+	fi
 
 	if [ -f "$FILE_DOTENV" ]; then eval "$(cat $FILE_DOTENV)"; fi
 	EXTRA_FLAGS=${EXTRA_FLAGS:-""}
@@ -58,18 +71,26 @@ compile_file() {
 	# we let it split, but we quote the path-based variables.
 	FLAGS+=($EXTRA_FLAGS) 
 	FLAGS+=("-o" "$OUTPUT_PATH")
-	FLAGS+=("$FILE_NO_SUFFIX.m")
+	FLAGS+=("$FILE")
 
-	# Add sources (if multiple, loop through them to preserve spaces)
+	# Add non-C sources first, then C sources last (with -x c) so -x none is never needed
+	C_SOURCES=()
 	for SRC in $CLANG_SOURCES; do
-		FLAGS+=("$SRC")
+		if [[ "$COMPILER" == "clang++" && "$SRC" == *.c ]]; then
+			C_SOURCES+=("$SRC")
+		else
+			FLAGS+=("$SRC")
+		fi
 	done
+	if [[ ${#C_SOURCES[@]} -gt 0 ]]; then
+		FLAGS+=("-x" "c" "${C_SOURCES[@]}")
+	fi
 
 	mkdir -p "$OUTPUT_DIR"
 
 	# 6. Execute using the special array expansion symbol "${ARRAY[@]}"
-	echo "Running: clang ${FLAGS[@]}"
-	clang "${FLAGS[@]}"
+	echo "Running: $COMPILER ${FLAGS[@]}"
+	"$COMPILER" "${FLAGS[@]}"
 	echo "Successfully compiled $FILE to $OUTPUT_PATH"
 }
 

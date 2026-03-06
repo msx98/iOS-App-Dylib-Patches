@@ -1,4 +1,5 @@
 #import <Foundation/Foundation.h>
+#include <objc/objc.h>
 #import <objc/runtime.h>
 
 #include "../../lib/utils/utils.m"
@@ -75,6 +76,7 @@ static PerformTextSelectionActionFunc orig_performAction = NULL;
 
 __attribute__((swiftcall))
 void hooked_performAction(void* message, bool flag, void* attributedString, void* action) {
+	debug_print(@"[Tweak] performTextSelectionAction called with flag=%d", flag);
     if (orig_performAction) {
 		NSLog(@"[Tweak] performTextSelectionAction called. Overriding flag to true.");
         orig_performAction(message, true, attributedString, action);
@@ -84,15 +86,27 @@ void hooked_performAction(void* message, bool flag, void* attributedString, void
 	}
 }
 
+void lldb_smart_stop_sign() {
+	// This allows adding a breakpoint on lldp_stop_sign in LLDB to stop execution right before the hook is installed, which can be useful for debugging.
+	// You can set a breakpoint in LLDB with: `breakpoint set --func lldb_smart_stop_sign`
+	debug_print(@"[Tweak] Reached lldb_smart_stop_sign. Place an LLDB breakpoint here to inspect before the hook is installed.");
+}
+
+void breakpoint(NSString* message) {
+	debug_print(@"[Tweak] Breakpoint: %@", message);
+	lldb_smart_stop_sign();
+}
 
 
 // --- 2. The Objective-C Interception ---
 // We hook the Node's initializer to capture the Swift Interaction object
-static id (*orig_ChatControllerNode_init)(id self, SEL _cmd, id arg1, id arg2, id arg3, id arg4, id arg5);
+static id (*orig_ChatControllerNode_init)(void* arg1);
 
-id hooked_ChatControllerNode_init(id self, SEL _cmd, id arg1, id arg2, id arg3, id arg4, id arg5) {
+id hooked_ChatControllerNode_init(void* arg1) {	
     // 1. Let the original initialization happen
-    id instance = orig_ChatControllerNode_init(self, _cmd, arg1, arg2, arg3, arg4, arg5);
+	breakpoint(@"ChatControllerNode init");
+    id instance = orig_ChatControllerNode_init(arg1);
+	breakpoint(@"ChatControllerNode init completed");
     
     if (instance) {
 		debug_print(@"[Tweak] ChatControllerNode initialized. Attempting to locate Interaction object…");
@@ -115,6 +129,7 @@ id hooked_ChatControllerNode_init(id self, SEL _cmd, id arg1, id arg2, id arg3, 
                 dispatch_once(&onceToken, ^{
                     if (targetCode) {
 						debug_print(@"[Tweak] Original performTextSelectionAction located at %p. Installing hook…", targetCode);
+						
                         DobbyHook(targetCode, (void *)hooked_performAction, (void **)&orig_performAction);
                         debug_print(@"[Tweak] Successfully hooked performTextSelectionAction at %p", targetCode);
                     } else {
@@ -133,24 +148,37 @@ id hooked_ChatControllerNode_init(id self, SEL _cmd, id arg1, id arg2, id arg3, 
     return instance;
 }
 
+
+//static id (*orig_ChatControllerNode_init)(id self, void* arg1, void* arg2, void* arg3, void* arg4, void* arg5, void* arg6, void* arg7, void* arg8, void* arg9, void* arg10, void* arg11);
 @implementation NSObject (NodeHijack)
 
 + (void)load {
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
-        Class cls = objc_getClass("TelegramUI.ChatControllerNode");
-		//debug_print(@"[Tweak] Attempting to hook ChatControllerNode…");
-        if (!cls) return;
+		NSLog(@"[Tweak] NSObject load called. Scanning for ChatControllerNode class…");
+		Class ChatControllerNode = objc_getClass("TelegramUI.ChatControllerNode");
+		Class ChatControllerInteraction = objc_getClass("ChatControllerInteraction.ChatControllerInteraction");
+		if (!ChatControllerNode || !ChatControllerInteraction) {
+			NSLog(@"[Tweak] Failed to find ChatControllerNode or ChatControllerInteraction classes!");
+			return;
+		}
+		SEL sel_didLoad = @selector(didLoad); 
+		Method met_orig_didLoad = class_getInstanceMethod(ChatControllerNode, sel_didLoad);
+		if (met_orig_didLoad) {
+			NSLog(@"[Tweak] Found didLoad method on ChatControllerNode. Installing hook...");
+		} else {
+			NSLog(@"[Tweak] Failed to find didLoad method on ChatControllerNode!");
+			abort();
+		}
+		void (*imp_orig_didLoad)(id, SEL) = (void (*)(id, SEL))method_getImplementation(met_orig_didLoad);
+        if (!ChatControllerNode) return;
 
         // We hook 'didLoad' or 'init' - 'didLoad' is often safer in Telegram
-        SEL targetSel = @selector(didLoad); 
-        Method originalMethod = class_getInstanceMethod(cls, targetSel);
-        
-        void (*orig_didLoad)(id, SEL) = (void (*)(id, SEL))method_getImplementation(originalMethod);
+		NSLog(@"[Tweak] Attempting to hook ChatControllerNode's didLoad method…");
         
         // Replacement block for didLoad
         void (^replacement)(id) = ^(id self) {
-            orig_didLoad(self, targetSel); // Call original first
+            imp_orig_didLoad(self, sel_didLoad); // Call original first
 
             // Grab the interaction object from the ivar
             Ivar interactionIvar = class_getInstanceVariable([self class], "controllerInteraction");
@@ -158,20 +186,25 @@ id hooked_ChatControllerNode_init(id self, SEL _cmd, id arg1, id arg2, id arg3, 
                 uintptr_t interactionInstance = *(uintptr_t *)((uintptr_t)self + ivar_getOffset(interactionIvar));
                 
                 // Get the closure offset (we'll use ivar name to be safe)
-                Ivar swiftIvar = class_getInstanceVariable(objc_getClass("ChatControllerInteraction.ChatControllerInteraction"), "performTextSelectionAction");
+                Ivar swiftIvar = class_getInstanceVariable(ChatControllerInteraction, "performTextSelectionAction");
                 if (swiftIvar && interactionInstance) {
                     void **funcPtrLoc = (void **)(interactionInstance + ivar_getOffset(swiftIvar));
                     
                     static dispatch_once_t hookOnce;
                     dispatch_once(&hookOnce, ^{
+						lldb_smart_stop_sign(); // Place an LLDB breakpoint here to inspect before the hook is installed
                         DobbyHook(*funcPtrLoc, (void *)hooked_performAction, (void **)&orig_performAction);
-                        NSLog(@"[Tweak] Hooked performTextSelectionAction via didLoad!");
+                        debug_print(@"[Tweak] Hooked performTextSelectionAction via didLoad!");
                     });
                 }
             }
         };
 
-        method_setImplementation(originalMethod, imp_implementationWithBlock(replacement));
+        method_setImplementation(met_orig_didLoad, imp_implementationWithBlock(replacement));
+
+		// Now for the init
+		SEL sel_init = @selector(initWithContext:);
+		Method met_orig_init = class_getInstanceMethod(ChatControllerNode, sel_init);
     });
 }
 @end
@@ -181,18 +214,9 @@ id hooked_ChatControllerNode_init(id self, SEL _cmd, id arg1, id arg2, id arg3, 
 static void initializeTweak() {
     debug_print(@"[Tweak] Loader injected. Setting up hooks...");
 
-    // Hook the Objective-C initializer of the Node
-    // We use Dobby here too, or you could use MSHookMessageEx if using Substrate
-    Method m = class_getInstanceMethod(objc_getClass("TelegramUI.ChatControllerNode"), sel_registerName("initWithContext:tableAddress:controllerInteraction:interfaceInteraction:navigationController:"));
-    
-    if (m) {
-        DobbyHook((void *)method_getImplementation(m), 
-                  (void *)hooked_ChatControllerNode_init, 
-                  (void **)&orig_ChatControllerNode_init);
-        debug_print(@"[Tweak] ChatControllerNode hook installed.");
-    } else {
-        debug_print(@"[Tweak] Failed to find ChatControllerNode initializer.");
-    }
+    // Hook the Objective-C initializer of the Node using dobby
+
+
 }
 
 static void init() {

@@ -1,0 +1,1 @@
+./scripts/serve tweaks/telegram/DisableSiriINPreferences.m build/Flex.dylib tweaks/FlexDispatcher.m tweaks/wechat/WebRecorder.m $@
