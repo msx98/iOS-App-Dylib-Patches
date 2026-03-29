@@ -4,17 +4,24 @@
 
 #import "utils.h"
 
-// ─── Spoofed coordinates ──────────────────────────────────────────────────────
-// Loaded from <Documents>/location.txt ("lat,lon"), else defaults to Tel Aviv.
+// ─── Spoofed coordinates + timezone + locale ─────────────────────────────────
+// Loaded from <Documents>/location.txt ("lat,lon[,Timezone/Name[,locale]]"),
+// e.g. "31.041,32.194,Asia/Jerusalem,en-US"
+// Omit trailing fields to skip that spoofing. Defaults to Tel Aviv / Asia/Jerusalem.
 
 static CLLocationDegrees spoofLat = 32.084270;
 static CLLocationDegrees spoofLon = 34.769603;
+static NSString *spoofTimezoneID  = nil; // nil = no timezone spoofing
+static NSString *spoofLocaleID    = nil; // nil = no locale spoofing
+
+static NSString *trimmed(NSString *s) {
+    return [s stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+}
 
 static void loadCoordinates(void) {
     NSString *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
     NSString *path = [docs stringByAppendingPathComponent:@"location.txt"];
-    NSString *raw = [[NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:nil]
-                     stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    NSString *raw = [trimmed([NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:nil]) copy];
     if (raw.length) {
         NSArray<NSString *> *parts = [raw componentsSeparatedByString:@","];
         if (parts.count >= 2) {
@@ -23,15 +30,30 @@ static void loadCoordinates(void) {
             if (lat != 0.0 || lon != 0.0) {
                 spoofLat = lat;
                 spoofLon = lon;
-                debug_print(@"[Grindr/LocationSpoof] Loaded from location.txt: %.6f, %.6f", spoofLat, spoofLon);
+                if (parts.count >= 3) {
+                    NSString *tzID = trimmed(parts[2]);
+                    if (tzID.length && [NSTimeZone timeZoneWithName:tzID]) {
+                        spoofTimezoneID = tzID;
+                    } else if (tzID.length) {
+                        debug_print(@"[LocationSpoof] Unknown timezone '%@', skipping", tzID);
+                    }
+                }
+                if (parts.count >= 4) {
+                    NSString *locID = trimmed(parts[3]);
+                    // Accept any non-empty string — NSLocale is lenient with unknown IDs.
+                    if (locID.length) spoofLocaleID = locID;
+                }
+                debug_print(@"[LocationSpoof] Loaded: %.6f, %.6f, tz=%@, locale=%@",
+                            spoofLat, spoofLon,
+                            spoofTimezoneID ?: @"(none)", spoofLocaleID ?: @"(none)");
                 return;
             }
         }
-        debug_print(@"[Grindr/LocationSpoof] location.txt parse failed, using default");
+        debug_print(@"[LocationSpoof] location.txt parse failed, using default");
     } else {
-        NSString *defaultContents = [NSString stringWithFormat:@"%.6f,%.6f\n", spoofLat, spoofLon];
+        NSString *defaultContents = [NSString stringWithFormat:@"%.6f,%.6f,Asia/Jerusalem\n", spoofLat, spoofLon];
         [defaultContents writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
-        debug_print(@"[Grindr/LocationSpoof] Created location.txt with default: %.6f, %.6f", spoofLat, spoofLon);
+        debug_print(@"[LocationSpoof] Created location.txt with default: %.6f, %.6f, Asia/Jerusalem", spoofLat, spoofLon);
     }
 }
 
@@ -55,7 +77,7 @@ static void fireAuthGranted(CLLocationManager *mgr, id<CLLocationManagerDelegate
 static void feedFakeLocation(CLLocationManager *mgr, id<CLLocationManagerDelegate> delegate) {
     if ([delegate respondsToSelector:@selector(locationManager:didUpdateLocations:)]) {
         [delegate locationManager:mgr didUpdateLocations:@[fakeLocation()]];
-        debug_print(@"[Grindr/LocationSpoof] Injected fake location to delegate");
+        //debug_print(@"[LocationSpoof] Injected fake location to delegate");
     }
 }
 
@@ -76,7 +98,7 @@ static void feedFakeLocation(CLLocationManager *mgr, id<CLLocationManagerDelegat
 
 - (void)locationManager:(CLLocationManager *)manager didFailWithError:(NSError *)error {
     if ([error.domain isEqualToString:kCLErrorDomain] && error.code == kCLErrorDenied) {
-        debug_print(@"[Grindr/LocationSpoof] Suppressed kCLErrorDenied, injecting fake location");
+        //debug_print(@"[LocationSpoof] Suppressed kCLErrorDenied, injecting fake location");
         dispatch_async(dispatch_get_main_queue(), ^{
             feedFakeLocation(manager, self.real);
         });
@@ -210,6 +232,40 @@ static void hooked_startMonitoringSignificantLocationChanges(CLLocationManager *
     injectAfterStart(self_);
 }
 
+// ─── NSLocale hooks ───────────────────────────────────────────────────────────
+
+static NSLocale *(*orig_currentLocale)(id, SEL);
+static NSLocale *hooked_currentLocale(id self_, SEL _cmd) {
+    if (spoofLocaleID) return [NSLocale localeWithLocaleIdentifier:spoofLocaleID];
+    return orig_currentLocale(self_, _cmd);
+}
+
+static NSLocale *(*orig_autoupdatingCurrentLocale)(id, SEL);
+static NSLocale *hooked_autoupdatingCurrentLocale(id self_, SEL _cmd) {
+    if (spoofLocaleID) return [NSLocale localeWithLocaleIdentifier:spoofLocaleID];
+    return orig_autoupdatingCurrentLocale(self_, _cmd);
+}
+
+static NSArray<NSString *> *(*orig_preferredLanguages)(id, SEL);
+static NSArray<NSString *> *hooked_preferredLanguages(id self_, SEL _cmd) {
+    if (spoofLocaleID) return @[spoofLocaleID];
+    return orig_preferredLanguages(self_, _cmd);
+}
+
+// ─── NSTimeZone hooks ─────────────────────────────────────────────────────────
+
+static NSTimeZone *(*orig_localTimeZone)(id, SEL);
+static NSTimeZone *hooked_localTimeZone(id self_, SEL _cmd) {
+    if (spoofTimezoneID) return [NSTimeZone timeZoneWithName:spoofTimezoneID];
+    return orig_localTimeZone(self_, _cmd);
+}
+
+static NSTimeZone *(*orig_systemTimeZone)(id, SEL);
+static NSTimeZone *hooked_systemTimeZone(id self_, SEL _cmd) {
+    if (spoofTimezoneID) return [NSTimeZone timeZoneWithName:spoofTimezoneID];
+    return orig_systemTimeZone(self_, _cmd);
+}
+
 // ─── Init ─────────────────────────────────────────────────────────────────────
 
 void init() {
@@ -266,5 +322,33 @@ void init() {
     orig_startMonitoringSignificantLocationChanges = (void (*)(id, SEL))method_getImplementation(smlc);
     method_setImplementation(smlc, (IMP)hooked_startMonitoringSignificantLocationChanges);
 
-    debug_print(@"[Grindr/LocationSpoof] Hooks installed (%.6f, %.6f)", spoofLat, spoofLon);
+    if (spoofLocaleID) {
+        Class lc = [NSLocale class];
+
+        Method cur = class_getClassMethod(lc, @selector(currentLocale));
+        orig_currentLocale = (NSLocale *(*)(id, SEL))method_getImplementation(cur);
+        method_setImplementation(cur, (IMP)hooked_currentLocale);
+
+        Method auc = class_getClassMethod(lc, @selector(autoupdatingCurrentLocale));
+        orig_autoupdatingCurrentLocale = (NSLocale *(*)(id, SEL))method_getImplementation(auc);
+        method_setImplementation(auc, (IMP)hooked_autoupdatingCurrentLocale);
+
+        Method pl = class_getClassMethod(lc, @selector(preferredLanguages));
+        orig_preferredLanguages = (NSArray<NSString *> *(*)(id, SEL))method_getImplementation(pl);
+        method_setImplementation(pl, (IMP)hooked_preferredLanguages);
+    }
+
+    if (spoofTimezoneID) {
+        Class tz = [NSTimeZone class];
+        Method ltz = class_getClassMethod(tz, @selector(localTimeZone));
+        orig_localTimeZone = (NSTimeZone *(*)(id, SEL))method_getImplementation(ltz);
+        method_setImplementation(ltz, (IMP)hooked_localTimeZone);
+
+        Method stz = class_getClassMethod(tz, @selector(systemTimeZone));
+        orig_systemTimeZone = (NSTimeZone *(*)(id, SEL))method_getImplementation(stz);
+        method_setImplementation(stz, (IMP)hooked_systemTimeZone);
+    }
+
+    debug_print(@"[LocationSpoof] Hooks installed (%.6f, %.6f%@)", spoofLat, spoofLon,
+                spoofTimezoneID ? [NSString stringWithFormat:@", %@", spoofTimezoneID] : @"");
 }

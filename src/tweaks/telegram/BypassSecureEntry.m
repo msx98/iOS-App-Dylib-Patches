@@ -2,7 +2,6 @@
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 
-#import "utils.h"
 
 static IMP origSetSecureTextField = NULL;
 static IMP origSetSecureTextView = NULL;
@@ -11,15 +10,10 @@ static void hookClass(Class cls, IMP *origStore) {
   if (!cls)
     return;
 
-  // Getter: isSecureTextEntry → always YES
-  BOOL (^getterBlock)(id) = ^BOOL(id self) {
-    NSArray<NSString *> *stack = [NSThread callStackSymbols];
-    debug_print(@"[BypassSecureEntry] isSecureTextEntry called on %@:\n%@",
-                self, [stack componentsJoinedByString:@"\n"]);
-    return NO;
-  };
+  // Getter: isSecureTextEntry → always NO
   class_replaceMethod(cls, @selector(isSecureTextEntry),
-                      imp_implementationWithBlock(getterBlock), "B@:");
+                      imp_implementationWithBlock(^BOOL(id _self) { return NO; }),
+                      "B@:");
 
   // Setter: setSecureTextEntry: → always NO (text stays visible)
   Method setterMethod =
@@ -35,13 +29,11 @@ static void hookClass(Class cls, IMP *origStore) {
                              imp_implementationWithBlock(setterBlock));
   }
 
-  debug_print(@"[BypassSecureEntry] Hooked %s", class_getName(cls));
 }
 
 void init() {
   hookClass(objc_getClass("UITextField"), &origSetSecureTextField);
   hookClass(objc_getClass("UITextView"), &origSetSecureTextView);
-  debug_print(@"[BypassSecureEntry] Hooks installed");
 }
 
 
