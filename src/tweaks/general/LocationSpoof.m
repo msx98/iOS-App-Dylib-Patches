@@ -146,6 +146,10 @@ static CLAuthorizationStatus hooked_authorizationStatus_instance(id self_, SEL _
     return kCLAuthorizationStatusAuthorizedAlways;
 }
 
+static CLAccuracyAuthorization hooked_accuracyAuthorization(id self_, SEL _cmd) {
+    return CLAccuracyAuthorizationFullAccuracy;
+}
+
 // ─── setDelegate: hook — install the proxy ────────────────────────────────────
 
 static void (*orig_setDelegate)(CLLocationManager *, SEL, id<CLLocationManagerDelegate>);
@@ -231,6 +235,11 @@ void init() {
     if (authI) {
         orig_authorizationStatus_instance = (CLAuthorizationStatus (*)(id, SEL))method_getImplementation(authI);
         method_setImplementation(authI, (IMP)hooked_authorizationStatus_instance);
+    }
+
+    Method aa = class_getInstanceMethod(mgr, @selector(accuracyAuthorization));
+    if (aa) {
+        method_setImplementation(aa, (IMP)hooked_accuracyAuthorization);
     }
 
     Method sd = class_getInstanceMethod(mgr, @selector(setDelegate:));
