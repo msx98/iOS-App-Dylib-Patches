@@ -1,8 +1,12 @@
 #import <Foundation/Foundation.h>
 #import <CoreLocation/CoreLocation.h>
+#import <CoreFoundation/CoreFoundation.h>
 #import <objc/runtime.h>
+#include <stdlib.h>
+#include <time.h>
 
 #import "utils.h"
+#import "submodules/fishhook/fishhook.h"
 
 // ─── Spoofed coordinates + timezone + locale ─────────────────────────────────
 // Loaded from <Documents>/location.txt ("lat,lon[,Timezone/Name[,locale]]"),
@@ -266,6 +270,33 @@ static NSTimeZone *hooked_systemTimeZone(id self_, SEL _cmd) {
     return orig_systemTimeZone(self_, _cmd);
 }
 
+static NSTimeZone *(*orig_defaultTimeZone)(id, SEL);
+static NSTimeZone *hooked_defaultTimeZone(id self_, SEL _cmd) {
+    if (spoofTimezoneID) return [NSTimeZone timeZoneWithName:spoofTimezoneID];
+    return orig_defaultTimeZone(self_, _cmd);
+}
+
+static void (*orig_setDefaultTimeZone)(id, SEL, NSTimeZone *);
+static void hooked_setDefaultTimeZone(id self_, SEL _cmd, NSTimeZone *tz) {
+    // Silently ignore — our spoofed timezone stays in place.
+}
+
+// ─── CFTimeZone hooks (fishhook) ──────────────────────────────────────────────
+// NSDateFormatter and most CF/Swift date APIs call these C functions directly,
+// bypassing the ObjC method hooks above.
+
+static CFTimeZoneRef (*orig_CFTimeZoneCopyDefault)(void);
+static CFTimeZoneRef hooked_CFTimeZoneCopyDefault(void) {
+    if (spoofTimezoneID) return (CFTimeZoneRef)CFBridgingRetain([NSTimeZone timeZoneWithName:spoofTimezoneID]);
+    return orig_CFTimeZoneCopyDefault();
+}
+
+static CFTimeZoneRef (*orig_CFTimeZoneCopySystem)(void);
+static CFTimeZoneRef hooked_CFTimeZoneCopySystem(void) {
+    if (spoofTimezoneID) return (CFTimeZoneRef)CFBridgingRetain([NSTimeZone timeZoneWithName:spoofTimezoneID]);
+    return orig_CFTimeZoneCopySystem();
+}
+
 // ─── Init ─────────────────────────────────────────────────────────────────────
 
 void init() {
@@ -340,6 +371,7 @@ void init() {
 
     if (spoofTimezoneID) {
         Class tz = [NSTimeZone class];
+
         Method ltz = class_getClassMethod(tz, @selector(localTimeZone));
         orig_localTimeZone = (NSTimeZone *(*)(id, SEL))method_getImplementation(ltz);
         method_setImplementation(ltz, (IMP)hooked_localTimeZone);
@@ -347,6 +379,34 @@ void init() {
         Method stz = class_getClassMethod(tz, @selector(systemTimeZone));
         orig_systemTimeZone = (NSTimeZone *(*)(id, SEL))method_getImplementation(stz);
         method_setImplementation(stz, (IMP)hooked_systemTimeZone);
+
+        Method dtz = class_getClassMethod(tz, @selector(defaultTimeZone));
+        orig_defaultTimeZone = (NSTimeZone *(*)(id, SEL))method_getImplementation(dtz);
+        method_setImplementation(dtz, (IMP)hooked_defaultTimeZone);
+
+        struct rebinding tz_rebindings[] = {
+            {"CFTimeZoneCopyDefault", hooked_CFTimeZoneCopyDefault, (void **)&orig_CFTimeZoneCopyDefault},
+            {"CFTimeZoneCopySystem",  hooked_CFTimeZoneCopySystem,  (void **)&orig_CFTimeZoneCopySystem},
+        };
+        rebind_symbols(tz_rebindings, 2);
+
+        // Set at the C library level — this is what CFTimeZone ultimately reads.
+        setenv("TZ", spoofTimezoneID.UTF8String, 1);
+        tzset();
+
+        // Force NSTimeZone to re-read the system timezone from the updated env.
+        [NSTimeZone resetSystemTimeZone];
+
+        // Also set the process-wide ObjC/CF default and invalidate cached formatters.
+        NSTimeZone *spoofTZ = [NSTimeZone timeZoneWithName:spoofTimezoneID];
+        [NSTimeZone setDefaultTimeZone:spoofTZ];
+        [[NSNotificationCenter defaultCenter]
+            postNotificationName:NSSystemTimeZoneDidChangeNotification object:nil];
+
+        // Block the app from overriding our default back.
+        Method sdtz = class_getClassMethod([NSTimeZone class], @selector(setDefaultTimeZone:));
+        orig_setDefaultTimeZone = (void (*)(id, SEL, NSTimeZone *))method_getImplementation(sdtz);
+        method_setImplementation(sdtz, (IMP)hooked_setDefaultTimeZone);
     }
 
     debug_print(@"[LocationSpoof] Hooks installed (%.6f, %.6f%@)", spoofLat, spoofLon,
