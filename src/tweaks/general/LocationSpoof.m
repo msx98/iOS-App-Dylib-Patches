@@ -8,10 +8,10 @@
 #import "utils.h"
 #import "submodules/fishhook/fishhook.h"
 
-// ─── Spoofed coordinates + timezone + locale ─────────────────────────────────
-// Loaded from <Documents>/location.txt ("lat,lon[,Timezone/Name[,locale]]"),
-// e.g. "31.041,32.194,Asia/Jerusalem,en-US"
-// Omit trailing fields to skip that spoofing. Defaults to Tel Aviv / Asia/Jerusalem.
+// ─── Spoofed coordinates + locale + timezone ─────────────────────────────────
+// Loaded from <Documents>/location.txt ("lat,lon[,locale[,Timezone/Name]]"),
+// e.g. "31.041,32.194,en-US,Asia/Jerusalem"
+// Timezone is optional — omit to auto-detect from coordinates.
 
 static CLLocationDegrees spoofLat = 32.084270;
 static CLLocationDegrees spoofLon = 34.769603;
@@ -35,17 +35,16 @@ static void loadCoordinates(void) {
                 spoofLat = lat;
                 spoofLon = lon;
                 if (parts.count >= 3) {
-                    NSString *tzID = trimmed(parts[2]);
+                    NSString *locID = trimmed(parts[2]);
+                    if (locID.length) spoofLocaleID = locID;
+                }
+                if (parts.count >= 4) {
+                    NSString *tzID = trimmed(parts[3]);
                     if (tzID.length && [NSTimeZone timeZoneWithName:tzID]) {
                         spoofTimezoneID = tzID;
                     } else if (tzID.length) {
                         debug_print(@"[LocationSpoof] Unknown timezone '%@', skipping", tzID);
                     }
-                }
-                if (parts.count >= 4) {
-                    NSString *locID = trimmed(parts[3]);
-                    // Accept any non-empty string — NSLocale is lenient with unknown IDs.
-                    if (locID.length) spoofLocaleID = locID;
                 }
                 debug_print(@"[LocationSpoof] Loaded: %.6f, %.6f, tz=%@, locale=%@",
                             spoofLat, spoofLon,
@@ -55,7 +54,7 @@ static void loadCoordinates(void) {
         }
         debug_print(@"[LocationSpoof] location.txt parse failed, using default");
     } else {
-        NSString *defaultContents = [NSString stringWithFormat:@"%.6f,%.6f,Asia/Jerusalem\n", spoofLat, spoofLon];
+        NSString *defaultContents = [NSString stringWithFormat:@"%.6f,%.6f,en-US,Asia/Jerusalem\n", spoofLat, spoofLon];
         [defaultContents writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
         debug_print(@"[LocationSpoof] Created location.txt with default: %.6f, %.6f, Asia/Jerusalem", spoofLat, spoofLon);
     }
@@ -256,6 +255,29 @@ static NSArray<NSString *> *hooked_preferredLanguages(id self_, SEL _cmd) {
     return orig_preferredLanguages(self_, _cmd);
 }
 
+// Forward-declared here because applyTimezone calls it before the hook block defines it.
+static void (*orig_setDefaultTimeZone)(id, SEL, NSTimeZone *);
+
+// ─── Timezone application ─────────────────────────────────────────────────────
+// Called both from init() (explicit TZ in location.txt) and from the geocoder
+// callback (auto-detected from coordinates).
+
+static void applyTimezone(NSString *tzID) {
+    spoofTimezoneID = tzID;
+    setenv("TZ", tzID.UTF8String, 1);
+    tzset();
+    [NSTimeZone resetSystemTimeZone];
+    NSTimeZone *spoofTZ = [NSTimeZone timeZoneWithName:tzID];
+    // Call orig directly — hooked_setDefaultTimeZone is already installed and would swallow this.
+    if (orig_setDefaultTimeZone)
+        orig_setDefaultTimeZone([NSTimeZone class], @selector(setDefaultTimeZone:), spoofTZ);
+    else
+        [NSTimeZone setDefaultTimeZone:spoofTZ];
+    [[NSNotificationCenter defaultCenter]
+        postNotificationName:NSSystemTimeZoneDidChangeNotification object:nil];
+    debug_print(@"[LocationSpoof] Timezone applied: %@", tzID);
+}
+
 // ─── NSTimeZone hooks ─────────────────────────────────────────────────────────
 
 static NSTimeZone *(*orig_localTimeZone)(id, SEL);
@@ -276,7 +298,6 @@ static NSTimeZone *hooked_defaultTimeZone(id self_, SEL _cmd) {
     return orig_defaultTimeZone(self_, _cmd);
 }
 
-static void (*orig_setDefaultTimeZone)(id, SEL, NSTimeZone *);
 static void hooked_setDefaultTimeZone(id self_, SEL _cmd, NSTimeZone *tz) {
     // Silently ignore — our spoofed timezone stays in place.
 }
@@ -369,7 +390,8 @@ void init() {
         method_setImplementation(pl, (IMP)hooked_preferredLanguages);
     }
 
-    if (spoofTimezoneID) {
+    // Install all timezone hooks unconditionally — they guard on spoofTimezoneID at call time.
+    {
         Class tz = [NSTimeZone class];
 
         Method ltz = class_getClassMethod(tz, @selector(localTimeZone));
@@ -384,29 +406,34 @@ void init() {
         orig_defaultTimeZone = (NSTimeZone *(*)(id, SEL))method_getImplementation(dtz);
         method_setImplementation(dtz, (IMP)hooked_defaultTimeZone);
 
+        Method sdtz = class_getClassMethod(tz, @selector(setDefaultTimeZone:));
+        orig_setDefaultTimeZone = (void (*)(id, SEL, NSTimeZone *))method_getImplementation(sdtz);
+        method_setImplementation(sdtz, (IMP)hooked_setDefaultTimeZone);
+
         struct rebinding tz_rebindings[] = {
             {"CFTimeZoneCopyDefault", hooked_CFTimeZoneCopyDefault, (void **)&orig_CFTimeZoneCopyDefault},
             {"CFTimeZoneCopySystem",  hooked_CFTimeZoneCopySystem,  (void **)&orig_CFTimeZoneCopySystem},
         };
         rebind_symbols(tz_rebindings, 2);
+    }
 
-        // Set at the C library level — this is what CFTimeZone ultimately reads.
-        setenv("TZ", spoofTimezoneID.UTF8String, 1);
-        tzset();
-
-        // Force NSTimeZone to re-read the system timezone from the updated env.
-        [NSTimeZone resetSystemTimeZone];
-
-        // Also set the process-wide ObjC/CF default and invalidate cached formatters.
-        NSTimeZone *spoofTZ = [NSTimeZone timeZoneWithName:spoofTimezoneID];
-        [NSTimeZone setDefaultTimeZone:spoofTZ];
-        [[NSNotificationCenter defaultCenter]
-            postNotificationName:NSSystemTimeZoneDidChangeNotification object:nil];
-
-        // Block the app from overriding our default back.
-        Method sdtz = class_getClassMethod([NSTimeZone class], @selector(setDefaultTimeZone:));
-        orig_setDefaultTimeZone = (void (*)(id, SEL, NSTimeZone *))method_getImplementation(sdtz);
-        method_setImplementation(sdtz, (IMP)hooked_setDefaultTimeZone);
+    if (spoofTimezoneID) {
+        applyTimezone(spoofTimezoneID);
+    } else {
+        // No timezone in location.txt — reverse-geocode the spoofed coordinates.
+        CLLocation *loc = [[CLLocation alloc] initWithLatitude:spoofLat longitude:spoofLon];
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+        [[CLGeocoder new] reverseGeocodeLocation:loc completionHandler:^(NSArray<CLPlacemark *> *placemarks, NSError *error) {
+            NSTimeZone *tz = placemarks.firstObject.timeZone;
+            if (tz) {
+                NSString *tzName = [tz.name stringByReplacingOccurrencesOfString:@" " withString:@"_"];
+                applyTimezone(tzName);
+            } else {
+                debug_print(@"[LocationSpoof] Geocoder failed to determine timezone: %@", error);
+            }
+        }];
+#pragma clang diagnostic pop
     }
 
     debug_print(@"[LocationSpoof] Hooks installed (%.6f, %.6f%@)", spoofLat, spoofLon,
