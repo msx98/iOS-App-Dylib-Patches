@@ -6,9 +6,23 @@
 #import "submodules/fishhook/fishhook.h"
 #import "utils.h"
 
-// Pitch shift in cents. +100 = 1 semitone up, -100 = 1 semitone down.
-// Examples: +400 (~4 semitones), -300 (~3 semitones down), +1200 = one octave up
-static const float kPitchCents = 400.0f;
+// Pitch drift — range and momentum tuning.
+// ±800 cents = roughly ±8 semitones; speech stays recognisable within this range.
+static const float kPitchMin     = +200.0f;
+static const float kPitchMax     = +800.0f;
+static const float kPitchDamp    =    0.90f;  // stronger damp than overlap for smoother glide
+static const float kPitchImpulse =   25.0f;   // cents per update; scales momentum buildup
+
+// Overlap drift — range and momentum tuning.
+// Overlap affects phase-vocoder quality; 4–16 keeps speech intelligible.
+static const float kOverlapMin  =  4.0f;
+static const float kOverlapMax  = 32.0f;
+// Damping per update (0 = instant stop, 1 = no damping).
+static const float kOverlapDamp =  0.92f;
+// Max random impulse magnitude added to momentum each update.
+static const float kOverlapImpulse = 2.00f;
+// Update overlap every N render calls (~200 ms at typical 10 ms buffers).
+static const int   kOverlapUpdateEvery = 1;
 
 // --- Globals ---
 static OSStatus (*orig_AudioUnitRender)(AudioUnit, AudioUnitRenderActionFlags *,
@@ -21,6 +35,17 @@ static AVAudioSourceNode *g_sourceNode = nil;
 static AVAudioFormat *g_format = nil;
 static AVAudioEngineManualRenderingBlock g_renderBlock = nil;
 static BOOL g_engineReady = NO;
+
+// Overlap drift state.
+static float g_overlap         = 8.0f;
+static float g_overlapMomentum = 0.0f;
+
+// Pitch drift state — starts at centre of range (0 = no shift).
+static float g_pitch           = 410.0f;
+static float g_pitchMomentum   = 30.0f;
+
+// Shared tick counter drives both overlap and pitch updates.
+static int   g_overlapTick     = 0;
 
 // The AudioUnit the engine was set up for. If a different unit is seen
 // (e.g. VoiceProcessingIO for calls vs RemoteIO for voice notes), we
@@ -40,10 +65,34 @@ static UInt32 g_floatMicBufCapacity = 0;
 static const float *g_currentMicData = NULL;
 static UInt32 g_currentFrameCount = 0;
 
+// Called every kOverlapUpdateEvery render calls.
+// Applies a random impulse to momentum, damps, moves overlap, bounces at bounds.
+static void updateOverlap(void) {
+    // Random impulse in [-kOverlapImpulse, +kOverlapImpulse]
+    float r = (float)(arc4random() % 10000) / 10000.0f;  // [0, 1)
+    float impulse = (r - 0.5f) * 2.0f * kOverlapImpulse;
+    g_overlapMomentum = g_overlapMomentum * kOverlapDamp + impulse;
+    g_overlap += g_overlapMomentum;
+    // Bounce off bounds rather than hard-clamping, so momentum reverses.
+    if (g_overlap < kOverlapMin) { g_overlap = kOverlapMin; g_overlapMomentum = fabsf(g_overlapMomentum) * 0.5f; }
+    if (g_overlap > kOverlapMax) { g_overlap = kOverlapMax; g_overlapMomentum = -fabsf(g_overlapMomentum) * 0.5f; }
+    g_pitchNode.overlap = g_overlap;
+}
+
+static void updatePitch(void) {
+    float r = (float)(arc4random() % 10000) / 10000.0f;
+    float impulse = (r - 0.5f) * 2.0f * kPitchImpulse;
+    g_pitchMomentum = g_pitchMomentum * kPitchDamp + impulse;
+    g_pitch += g_pitchMomentum;
+    if (g_pitch < kPitchMin) { g_pitch = kPitchMin; g_pitchMomentum =  fabsf(g_pitchMomentum) * 0.5f; }
+    if (g_pitch > kPitchMax) { g_pitch = kPitchMax; g_pitchMomentum = -fabsf(g_pitchMomentum) * 0.5f; }
+    g_pitchNode.pitch = g_pitch;
+}
+
 static void setupEngine(double sampleRate, UInt32 channels) {
     g_engine = [[AVAudioEngine alloc] init];
     g_pitchNode = [[AVAudioUnitTimePitch alloc] init];
-    g_pitchNode.pitch = kPitchCents;
+    g_pitchNode.pitch = g_pitch;
     // overlap = 8 gives natural-sounding pitch shift. Safe now that AVAudioSourceNode
     // feeds data synchronously — no scheduling race to cause InsufficientDataFromInputNode.
     g_pitchNode.overlap = 8.0f;
@@ -94,7 +143,7 @@ static void setupEngine(double sampleRate, UInt32 channels) {
     g_engineReady = YES;
 
     debug_print(@"[PitchChanger] Engine ready — sr=%.0f ch=%u pitch=%.0f cents micFloat=%d",
-                sampleRate, (unsigned)channels, kPitchCents, (int)g_micIsFloat);
+                sampleRate, (unsigned)channels, g_pitch, (int)g_micIsFloat);
 }
 
 // Detect the actual stream format from the AudioUnit on first call.
@@ -138,6 +187,11 @@ OSStatus hooked_AudioUnitRender(AudioUnit inUnit,
               g_sourceNode = nil;
               g_renderBlock = nil;
               g_engineReady = NO;
+              g_overlap = 8.0f;
+              g_overlapMomentum = 0.0f;
+              g_pitch = 0.0f;
+              g_pitchMomentum = 0.0f;
+              g_overlapTick = 0;
           }
           g_lastUnit = inUnit;
           detectAndSetup(inUnit);
@@ -170,6 +224,13 @@ OSStatus hooked_AudioUnitRender(AudioUnit inUnit,
       g_currentMicData = g_floatMicBuf;
       g_currentFrameCount = frameCount;
 
+      // Drift pitch and overlap on a slow timer so they wander without jitter.
+      if (++g_overlapTick >= kOverlapUpdateEvery) {
+          g_overlapTick = 0;
+          updatePitch();
+          updateOverlap();
+      }
+
       AVAudioPCMBuffer *outBuf = [[AVAudioPCMBuffer alloc] initWithPCMFormat:g_format
                                                               frameCapacity:frameCount];
       outBuf.frameLength = frameCount;
@@ -197,7 +258,7 @@ OSStatus hooked_AudioUnitRender(AudioUnit inUnit,
                   vDSP_vfix16(g_floatMicBuf, 1, (int16_t *)ioData->mBuffers[0].mData, 1, outBuf.frameLength);
               }
           }
-          debug_print(@"[PitchChanger] render ok frames=%u peak=%.5f", outBuf.frameLength, peak);
+          debug_print(@"[PitchChanger] render ok frames=%u peak=%.5f, OL=%.0f, p=%.0f", outBuf.frameLength, peak, g_overlap, g_pitch);
       } else {
           debug_print(@"[PitchChanger] render status=%d err=%d frames=%u", (int)rs, (int)renderErr, frameCount);
       }
@@ -212,7 +273,7 @@ void init() {
         (struct rebinding[1]){{"AudioUnitRender", hooked_AudioUnitRender,
                                (void *)&orig_AudioUnitRender}},
         1);
-    debug_print(@"[PitchChanger] Hooked AudioUnitRender, pitch=%.0f cents", kPitchCents);
+    debug_print(@"[PitchChanger] Hooked AudioUnitRender — pitch drifting [%.0f, %.0f] cents", kPitchMin, kPitchMax);
 }
 
 
