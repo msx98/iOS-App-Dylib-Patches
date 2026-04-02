@@ -17,9 +17,58 @@ static CLLocationDegrees spoofLat = 32.084270;
 static CLLocationDegrees spoofLon = 34.769603;
 static NSString *spoofTimezoneID  = nil; // nil = no timezone spoofing
 static NSString *spoofLocaleID    = nil; // nil = no locale spoofing
+static NSString *spoofISOCountryCode = nil; // nil = no telephony country spoofing
+static NSString *spoofMobileCountryCode = nil; // nil = no MCC spoofing
+static NSString *spoofMobileNetworkCode = nil; // nil = no MNC spoofing
 
 static NSString *trimmed(NSString *s) {
     return [s stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+}
+
+static NSString *normalizedISOCountryCode(NSString *countryCode) {
+    NSString *t = trimmed(countryCode);
+    if (!t.length) return nil;
+    return t.lowercaseString;
+}
+
+static NSString *countryCodeFromLocaleID(NSString *localeID) {
+    if (!localeID.length) return nil;
+    NSDictionary<NSString *, NSString *> *parts = [NSLocale componentsFromLocaleIdentifier:localeID];
+    return normalizedISOCountryCode(parts[NSLocaleCountryCode]);
+}
+
+static NSString *mobileCountryCodeForISO(NSString *isoCode) {
+    static NSDictionary<NSString *, NSString *> *mccByISO;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        mccByISO = @{
+            @"ae": @"424", @"au": @"505", @"br": @"724", @"ca": @"302",
+            @"de": @"262", @"es": @"214", @"fr": @"208", @"gb": @"234",
+            @"il": @"425", @"in": @"404", @"it": @"222", @"jp": @"440",
+            @"kr": @"450", @"mx": @"334", @"nl": @"204", @"pl": @"260",
+            @"ru": @"250", @"sa": @"420", @"tr": @"286", @"ua": @"255",
+            @"us": @"310"
+        };
+    });
+    return mccByISO[isoCode];
+}
+
+static void applyISOCountryCode(NSString *isoCode) {
+    NSString *normalized = normalizedISOCountryCode(isoCode);
+    if (!normalized.length) return;
+    spoofISOCountryCode = normalized;
+    NSString *mcc = mobileCountryCodeForISO(normalized);
+    if (mcc.length) {
+        spoofMobileCountryCode = mcc;
+    }
+    if (!spoofMobileNetworkCode.length) {
+        // Keep MCC/MNC pair structurally valid when apps parse both.
+        spoofMobileNetworkCode = @"01";
+    }
+    debug_print(@"[LocationSpoof] Carrier ISO applied: %@ (mcc=%@, mnc=%@)",
+                spoofISOCountryCode,
+                spoofMobileCountryCode ?: @"(none)",
+                spoofMobileNetworkCode ?: @"(none)");
 }
 
 static void loadCoordinates(void) {
@@ -36,7 +85,13 @@ static void loadCoordinates(void) {
                 spoofLon = lon;
                 if (parts.count >= 3) {
                     NSString *locID = trimmed(parts[2]);
-                    if (locID.length) spoofLocaleID = locID;
+                    if (locID.length) {
+                        spoofLocaleID = locID;
+                        NSString *localeCountry = countryCodeFromLocaleID(locID);
+                        if (localeCountry.length) {
+                            applyISOCountryCode(localeCountry);
+                        }
+                    }
                 }
                 if (parts.count >= 4) {
                     NSString *tzID = trimmed(parts[3]);
@@ -46,9 +101,10 @@ static void loadCoordinates(void) {
                         debug_print(@"[LocationSpoof] Unknown timezone '%@', skipping", tzID);
                     }
                 }
-                debug_print(@"[LocationSpoof] Loaded: %.6f, %.6f, tz=%@, locale=%@",
+                debug_print(@"[LocationSpoof] Loaded: %.6f, %.6f, tz=%@, locale=%@, iso=%@",
                             spoofLat, spoofLon,
-                            spoofTimezoneID ?: @"(none)", spoofLocaleID ?: @"(none)");
+                            spoofTimezoneID ?: @"(none)", spoofLocaleID ?: @"(none)",
+                            spoofISOCountryCode ?: @"(none)");
                 return;
             }
         }
@@ -238,21 +294,106 @@ static void hooked_startMonitoringSignificantLocationChanges(CLLocationManager *
 // ─── NSLocale hooks ───────────────────────────────────────────────────────────
 
 static NSLocale *(*orig_currentLocale)(id, SEL);
+
+static NSLocale *spoofedLocale(void) {
+    if (spoofLocaleID.length) {
+        return [NSLocale localeWithLocaleIdentifier:spoofLocaleID];
+    }
+    if (spoofISOCountryCode.length) {
+        NSString *region = spoofISOCountryCode.uppercaseString;
+        return [NSLocale localeWithLocaleIdentifier:[NSString stringWithFormat:@"en-%@", region]];
+    }
+    return nil;
+}
+
 static NSLocale *hooked_currentLocale(id self_, SEL _cmd) {
-    if (spoofLocaleID) return [NSLocale localeWithLocaleIdentifier:spoofLocaleID];
+    NSLocale *locale = spoofedLocale();
+    if (locale) return locale;
     return orig_currentLocale(self_, _cmd);
 }
 
 static NSLocale *(*orig_autoupdatingCurrentLocale)(id, SEL);
 static NSLocale *hooked_autoupdatingCurrentLocale(id self_, SEL _cmd) {
-    if (spoofLocaleID) return [NSLocale localeWithLocaleIdentifier:spoofLocaleID];
+    NSLocale *locale = spoofedLocale();
+    if (locale) return locale;
     return orig_autoupdatingCurrentLocale(self_, _cmd);
 }
 
 static NSArray<NSString *> *(*orig_preferredLanguages)(id, SEL);
 static NSArray<NSString *> *hooked_preferredLanguages(id self_, SEL _cmd) {
-    if (spoofLocaleID) return @[spoofLocaleID];
+    if (spoofLocaleID.length) return @[spoofLocaleID];
     return orig_preferredLanguages(self_, _cmd);
+}
+
+static NSString *(*orig_localeCountryCode)(id, SEL);
+static NSString *hooked_localeCountryCode(id self_, SEL _cmd) {
+    if (spoofISOCountryCode.length) return spoofISOCountryCode.uppercaseString;
+    return orig_localeCountryCode ? orig_localeCountryCode(self_, _cmd) : nil;
+}
+
+// Swift's (Locale.current as NSLocale).object(forKey: .countryCode) calls
+// -[NSLocale objectForKey:] directly, bypassing the countryCode property getter.
+static id (*orig_localeObjectForKey)(id, SEL, NSLocaleKey);
+static id hooked_localeObjectForKey(id self_, SEL _cmd, NSLocaleKey key) {
+    if (spoofISOCountryCode.length && [key isEqualToString:NSLocaleCountryCode])
+        return spoofISOCountryCode.uppercaseString;
+    return orig_localeObjectForKey(self_, _cmd, key);
+}
+
+// ─── Telephony hooks (CTCarrier / CTTelephonyNetworkInfo) ───────────────────
+
+static NSString *(*orig_isoCountryCode)(id, SEL);
+static NSString *hooked_isoCountryCode(id self_, SEL _cmd) {
+    if (spoofISOCountryCode.length) return spoofISOCountryCode;
+    return orig_isoCountryCode ? orig_isoCountryCode(self_, _cmd) : nil;
+}
+
+static NSString *(*orig_mobileCountryCode)(id, SEL);
+static NSString *hooked_mobileCountryCode(id self_, SEL _cmd) {
+    if (spoofMobileCountryCode.length) return spoofMobileCountryCode;
+    return orig_mobileCountryCode ? orig_mobileCountryCode(self_, _cmd) : nil;
+}
+
+static NSString *(*orig_mobileNetworkCode)(id, SEL);
+static NSString *hooked_mobileNetworkCode(id self_, SEL _cmd) {
+    if (spoofISOCountryCode.length) {
+        return spoofMobileNetworkCode.length ? spoofMobileNetworkCode : @"01";
+    }
+    return orig_mobileNetworkCode ? orig_mobileNetworkCode(self_, _cmd) : nil;
+}
+
+static id (*orig_subscriberCellularProvider)(id, SEL);
+static NSDictionary<NSString *, id> *(*orig_serviceSubscriberCellularProviders)(id, SEL);
+
+static id fallbackCarrier(void) {
+    static id carrier;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        Class ctCarrier = NSClassFromString(@"CTCarrier");
+        if (ctCarrier) carrier = [ctCarrier new];
+    });
+    return carrier;
+}
+
+static id hooked_subscriberCellularProvider(id self_, SEL _cmd) {
+    id provider = orig_subscriberCellularProvider ? orig_subscriberCellularProvider(self_, _cmd) : nil;
+    if (provider) return provider;
+    if (spoofISOCountryCode.length) return fallbackCarrier();
+    return nil;
+}
+
+static NSDictionary<NSString *, id> *hooked_serviceSubscriberCellularProviders(id self_, SEL _cmd) {
+    NSDictionary<NSString *, id> *providers =
+        orig_serviceSubscriberCellularProviders ? orig_serviceSubscriberCellularProviders(self_, _cmd) : nil;
+    if (providers.count) return providers;
+
+    if (spoofISOCountryCode.length) {
+        id provider = fallbackCarrier();
+        if (provider) {
+            return @{@"spoof_service": provider};
+        }
+    }
+    return @{};
 }
 
 // Forward-declared here because applyTimezone calls it before the hook block defines it.
@@ -300,6 +441,35 @@ static NSTimeZone *hooked_defaultTimeZone(id self_, SEL _cmd) {
 
 static void hooked_setDefaultTimeZone(id self_, SEL _cmd, NSTimeZone *tz) {
     // Silently ignore — our spoofed timezone stays in place.
+}
+
+// ─── UIDevice private region hooks ───────────────────────────────────────────
+
+static NSString *(*orig_sfRegionCode)(id, SEL);
+static NSString *hooked_sfRegionCode(id self_, SEL _cmd) {
+    if (spoofISOCountryCode.length) return spoofISOCountryCode.uppercaseString;
+    return orig_sfRegionCode ? orig_sfRegionCode(self_, _cmd) : nil;
+}
+
+// ─── CFLocale hooks (fishhook) ────────────────────────────────────────────────
+// Swift and CF APIs call CFLocaleCopyCurrent() directly, bypassing
+// +[NSLocale currentLocale] and the ObjC hooks above.
+
+static CFLocaleRef (*orig_CFLocaleCopyCurrent)(void);
+static CFLocaleRef hooked_CFLocaleCopyCurrent(void) {
+    NSString *locID = spoofLocaleID.length ? spoofLocaleID
+                    : (spoofISOCountryCode.length
+                       ? [NSString stringWithFormat:@"en_%@", spoofISOCountryCode.uppercaseString]
+                       : nil);
+    if (locID) return CFLocaleCreate(kCFAllocatorDefault, (__bridge CFStringRef)locID);
+    return orig_CFLocaleCopyCurrent();
+}
+
+static CFArrayRef (*orig_CFLocaleCopyPreferredLanguages)(void);
+static CFArrayRef hooked_CFLocaleCopyPreferredLanguages(void) {
+    if (spoofLocaleID.length)
+        return (__bridge_retained CFArrayRef)@[spoofLocaleID];
+    return orig_CFLocaleCopyPreferredLanguages();
 }
 
 // ─── CFTimeZone hooks (fishhook) ──────────────────────────────────────────────
@@ -374,7 +544,7 @@ void init() {
     orig_startMonitoringSignificantLocationChanges = (void (*)(id, SEL))method_getImplementation(smlc);
     method_setImplementation(smlc, (IMP)hooked_startMonitoringSignificantLocationChanges);
 
-    if (spoofLocaleID) {
+    {
         Class lc = [NSLocale class];
 
         Method cur = class_getClassMethod(lc, @selector(currentLocale));
@@ -388,6 +558,74 @@ void init() {
         Method pl = class_getClassMethod(lc, @selector(preferredLanguages));
         orig_preferredLanguages = (NSArray<NSString *> *(*)(id, SEL))method_getImplementation(pl);
         method_setImplementation(pl, (IMP)hooked_preferredLanguages);
+
+        Method cc = class_getInstanceMethod(lc, @selector(countryCode));
+        if (cc) {
+            orig_localeCountryCode = (NSString *(*)(id, SEL))method_getImplementation(cc);
+            method_setImplementation(cc, (IMP)hooked_localeCountryCode);
+        }
+
+        Method okf = class_getInstanceMethod(lc, @selector(objectForKey:));
+        if (okf) {
+            orig_localeObjectForKey = (id (*)(id, SEL, NSLocaleKey))method_getImplementation(okf);
+            method_setImplementation(okf, (IMP)hooked_localeObjectForKey);
+        }
+    }
+
+    {
+        Class uiDevice = NSClassFromString(@"UIDevice");
+        if (uiDevice) {
+            SEL sfSel = NSSelectorFromString(@"sf_regionCode");
+            Method sfRegion = class_getInstanceMethod(uiDevice, sfSel);
+            if (sfRegion) {
+                orig_sfRegionCode = (NSString *(*)(id, SEL))method_getImplementation(sfRegion);
+                method_setImplementation(sfRegion, (IMP)hooked_sfRegionCode);
+                debug_print(@"[LocationSpoof] UIDevice sf_regionCode hooked");
+            } else {
+                // Method may not exist yet — add it so it's intercepted if called dynamically.
+                class_addMethod(uiDevice, sfSel, (IMP)hooked_sfRegionCode, "@@:");
+            }
+        }
+    }
+
+    {
+        Class ctCarrier = NSClassFromString(@"CTCarrier");
+        if (ctCarrier) {
+            debug_print(@"[LocationSpoof] CTCarrier class found, installing telephony hooks");
+            Method iso = class_getInstanceMethod(ctCarrier, NSSelectorFromString(@"isoCountryCode"));
+            if (iso) {
+                orig_isoCountryCode = (NSString *(*)(id, SEL))method_getImplementation(iso);
+                method_setImplementation(iso, (IMP)hooked_isoCountryCode);
+            }
+
+            Method mcc = class_getInstanceMethod(ctCarrier, NSSelectorFromString(@"mobileCountryCode"));
+            if (mcc) {
+                orig_mobileCountryCode = (NSString *(*)(id, SEL))method_getImplementation(mcc);
+                method_setImplementation(mcc, (IMP)hooked_mobileCountryCode);
+            }
+
+            Method mnc = class_getInstanceMethod(ctCarrier, NSSelectorFromString(@"mobileNetworkCode"));
+            if (mnc) {
+                orig_mobileNetworkCode = (NSString *(*)(id, SEL))method_getImplementation(mnc);
+                method_setImplementation(mnc, (IMP)hooked_mobileNetworkCode);
+            }
+        }
+
+        Class tni = NSClassFromString(@"CTTelephonyNetworkInfo");
+        if (tni) {
+            Method scp = class_getInstanceMethod(tni, NSSelectorFromString(@"subscriberCellularProvider"));
+            if (scp) {
+                orig_subscriberCellularProvider = (id (*)(id, SEL))method_getImplementation(scp);
+                method_setImplementation(scp, (IMP)hooked_subscriberCellularProvider);
+            }
+
+            Method sscp = class_getInstanceMethod(tni, NSSelectorFromString(@"serviceSubscriberCellularProviders"));
+            if (sscp) {
+                orig_serviceSubscriberCellularProviders =
+                    (NSDictionary<NSString *, id> *(*)(id, SEL))method_getImplementation(sscp);
+                method_setImplementation(sscp, (IMP)hooked_serviceSubscriberCellularProviders);
+            }
+        }
     }
 
     // Install all timezone hooks unconditionally — they guard on spoofTimezoneID at call time.
@@ -411,31 +649,56 @@ void init() {
         method_setImplementation(sdtz, (IMP)hooked_setDefaultTimeZone);
 
         struct rebinding tz_rebindings[] = {
-            {"CFTimeZoneCopyDefault", hooked_CFTimeZoneCopyDefault, (void **)&orig_CFTimeZoneCopyDefault},
-            {"CFTimeZoneCopySystem",  hooked_CFTimeZoneCopySystem,  (void **)&orig_CFTimeZoneCopySystem},
+            {"CFTimeZoneCopyDefault",         hooked_CFTimeZoneCopyDefault,         (void **)&orig_CFTimeZoneCopyDefault},
+            {"CFTimeZoneCopySystem",          hooked_CFTimeZoneCopySystem,           (void **)&orig_CFTimeZoneCopySystem},
+            {"CFLocaleCopyCurrent",           hooked_CFLocaleCopyCurrent,            (void **)&orig_CFLocaleCopyCurrent},
+            {"CFLocaleCopyPreferredLanguages",hooked_CFLocaleCopyPreferredLanguages, (void **)&orig_CFLocaleCopyPreferredLanguages},
         };
-        rebind_symbols(tz_rebindings, 2);
+        rebind_symbols(tz_rebindings, 4);
     }
 
-    if (spoofTimezoneID) {
+    BOOL needsTimezoneFromGeocoder = !spoofTimezoneID;
+    BOOL needsCountryFromGeocoder = !spoofISOCountryCode;
+
+    if (!needsTimezoneFromGeocoder && !needsCountryFromGeocoder) {
         applyTimezone(spoofTimezoneID);
     } else {
-        // No timezone in location.txt — reverse-geocode the spoofed coordinates.
+        // Reverse-geocode spoofed coordinates for missing timezone/country data.
         CLLocation *loc = [[CLLocation alloc] initWithLatitude:spoofLat longitude:spoofLon];
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
         [[CLGeocoder new] reverseGeocodeLocation:loc completionHandler:^(NSArray<CLPlacemark *> *placemarks, NSError *error) {
-            NSTimeZone *tz = placemarks.firstObject.timeZone;
-            if (tz) {
-                NSString *tzName = [tz.name stringByReplacingOccurrencesOfString:@" " withString:@"_"];
-                applyTimezone(tzName);
-            } else {
+            CLPlacemark *placemark = placemarks.firstObject;
+
+            if (needsCountryFromGeocoder) {
+                NSString *iso = normalizedISOCountryCode(placemark.ISOcountryCode);
+                if (iso.length) {
+                    applyISOCountryCode(iso);
+                } else {
+                    debug_print(@"[LocationSpoof] Geocoder failed to determine carrier country: %@", error);
+                }
+            }
+
+            if (needsTimezoneFromGeocoder) {
+                NSTimeZone *tz = placemark.timeZone;
+                if (tz) {
+                    NSString *tzName = [tz.name stringByReplacingOccurrencesOfString:@" " withString:@"_"];
+                    applyTimezone(tzName);
+                } else {
+                    debug_print(@"[LocationSpoof] Geocoder failed to determine timezone: %@", error);
+                }
+            } else if (spoofTimezoneID) {
+                applyTimezone(spoofTimezoneID);
+            }
+            if (!placemark) {
                 debug_print(@"[LocationSpoof] Geocoder failed to determine timezone: %@", error);
             }
         }];
 #pragma clang diagnostic pop
     }
 
-    debug_print(@"[LocationSpoof] Hooks installed (%.6f, %.6f%@)", spoofLat, spoofLon,
-                spoofTimezoneID ? [NSString stringWithFormat:@", %@", spoofTimezoneID] : @"");
+    debug_print(@"[LocationSpoof] Hooks installed (%.6f, %.6f%@%@%@)", spoofLat, spoofLon,
+                spoofTimezoneID ? [NSString stringWithFormat:@", tz=%@", spoofTimezoneID] : @"",
+                spoofISOCountryCode ? [NSString stringWithFormat:@", iso=%@", spoofISOCountryCode] : @"",
+                spoofMobileCountryCode ? [NSString stringWithFormat:@", mcc=%@", spoofMobileCountryCode] : @"");
 }
