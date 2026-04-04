@@ -2,6 +2,7 @@
 #import <CoreLocation/CoreLocation.h>
 #import <CoreFoundation/CoreFoundation.h>
 #import <objc/runtime.h>
+#import <objc/message.h>
 #include <stdlib.h>
 #include <time.h>
 
@@ -20,6 +21,7 @@ static NSString *spoofLocaleID    = nil; // nil = no locale spoofing
 static NSString *spoofISOCountryCode = nil; // nil = no telephony country spoofing
 static NSString *spoofMobileCountryCode = nil; // nil = no MCC spoofing
 static NSString *spoofMobileNetworkCode = nil; // nil = no MNC spoofing
+static NSString *spoofPhoneNumber       = nil; // nil = no phone number spoofing
 
 static NSString *trimmed(NSString *s) {
     return [s stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
@@ -31,22 +33,17 @@ static NSString *normalizedISOCountryCode(NSString *countryCode) {
     return t.lowercaseString;
 }
 
-static NSString *countryCodeFromLocaleID(NSString *localeID) {
-    if (!localeID.length) return nil;
-    NSDictionary<NSString *, NSString *> *parts = [NSLocale componentsFromLocaleIdentifier:localeID];
-    return normalizedISOCountryCode(parts[NSLocaleCountryCode]);
-}
 
 static NSString *mobileCountryCodeForISO(NSString *isoCode) {
     static NSDictionary<NSString *, NSString *> *mccByISO;
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
         mccByISO = @{
-            @"ae": @"424", @"au": @"505", @"br": @"724", @"ca": @"302",
+            @"ae": @"424", @"at": @"232", @"au": @"505", @"br": @"724", @"ca": @"302",
             @"de": @"262", @"es": @"214", @"fr": @"208", @"gb": @"234",
             @"il": @"425", @"in": @"404", @"it": @"222", @"jp": @"440",
             @"kr": @"450", @"mx": @"334", @"nl": @"204", @"pl": @"260",
-            @"ru": @"250", @"sa": @"420", @"tr": @"286", @"ua": @"255",
+            @"ro": @"226", @"ru": @"250", @"sa": @"420", @"tr": @"286", @"ua": @"255",
             @"us": @"310"
         };
     });
@@ -71,6 +68,16 @@ static void applyISOCountryCode(NSString *isoCode) {
                 spoofMobileNetworkCode ?: @"(none)");
 }
 
+static void loadPhoneNumber(void) {
+    NSString *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
+    NSString *path = [docs stringByAppendingPathComponent:@"phone.txt"];
+    NSString *raw = trimmed([NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:nil]);
+    if (raw.length) {
+        spoofPhoneNumber = raw;
+        debug_print(@"[LocationSpoof] Phone number loaded: %@", spoofPhoneNumber);
+    }
+}
+
 static void loadCoordinates(void) {
     NSString *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
     NSString *path = [docs stringByAppendingPathComponent:@"location.txt"];
@@ -87,10 +94,9 @@ static void loadCoordinates(void) {
                     NSString *locID = trimmed(parts[2]);
                     if (locID.length) {
                         spoofLocaleID = locID;
-                        NSString *localeCountry = countryCodeFromLocaleID(locID);
-                        if (localeCountry.length) {
-                            applyISOCountryCode(localeCountry);
-                        }
+                        // Do NOT derive ISO country from locale — country is always
+                        // determined from coordinates via the geocoder, so that e.g.
+                        // "en-US" locale with Vienna coords gives AT, not US.
                     }
                 }
                 if (parts.count >= 4) {
@@ -396,6 +402,20 @@ static NSDictionary<NSString *, id> *hooked_serviceSubscriberCellularProviders(i
     return @{};
 }
 
+// ─── Phone number hooks ───────────────────────────────────────────────────────
+
+static CFStringRef (*orig_CTSettingCopyMyPhoneNumber)(void);
+static CFStringRef hooked_CTSettingCopyMyPhoneNumber(void) {
+    if (spoofPhoneNumber) return (__bridge_retained CFStringRef)spoofPhoneNumber;
+    return orig_CTSettingCopyMyPhoneNumber ? orig_CTSettingCopyMyPhoneNumber() : NULL;
+}
+
+static NSString *(*orig_devicePhoneNumber)(id, SEL);
+static NSString *hooked_devicePhoneNumber(id self_, SEL _cmd) {
+    if (spoofPhoneNumber) return spoofPhoneNumber;
+    return orig_devicePhoneNumber ? orig_devicePhoneNumber(self_, _cmd) : nil;
+}
+
 // Forward-declared here because applyTimezone calls it before the hook block defines it.
 static void (*orig_setDefaultTimeZone)(id, SEL, NSTimeZone *);
 
@@ -488,10 +508,141 @@ static CFTimeZoneRef hooked_CFTimeZoneCopySystem(void) {
     return orig_CFTimeZoneCopySystem();
 }
 
+// ─── File watcher ─────────────────────────────────────────────────────────────
+
+static void setupLocationFileWatcher(void);
+
+static void setupLocationFileWatcher(void) {
+    NSString *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
+    NSString *path = [docs stringByAppendingPathComponent:@"location.txt"];
+    dispatch_queue_t q = dispatch_get_global_queue(QOS_CLASS_UTILITY, 0);
+
+    int fd = open(path.fileSystemRepresentation, O_EVTONLY);
+    if (fd < 0) {
+        // File absent — watch Documents directory until location.txt appears.
+        // Coords remain at their current values (defaults or last loaded).
+        int dirFd = open(docs.fileSystemRepresentation, O_EVTONLY);
+        if (dirFd < 0) return;
+
+        dispatch_source_t dirSrc = dispatch_source_create(
+            DISPATCH_SOURCE_TYPE_VNODE, (uintptr_t)dirFd,
+            DISPATCH_VNODE_WRITE,
+            q);
+
+        dispatch_source_set_event_handler(dirSrc, ^{
+            if ([[NSFileManager defaultManager] fileExistsAtPath:path]) {
+                dispatch_source_cancel(dirSrc);
+                loadCoordinates();
+                setupLocationFileWatcher();
+            }
+        });
+
+        dispatch_source_set_cancel_handler(dirSrc, ^{ close(dirFd); });
+        dispatch_resume(dirSrc);
+        return;
+    }
+
+    // File exists — watch it directly.
+    dispatch_source_t src = dispatch_source_create(
+        DISPATCH_SOURCE_TYPE_VNODE, (uintptr_t)fd,
+        DISPATCH_VNODE_WRITE | DISPATCH_VNODE_DELETE | DISPATCH_VNODE_RENAME,
+        q);
+
+    dispatch_source_set_event_handler(src, ^{
+        unsigned long flags = dispatch_source_get_data(src);
+        loadCoordinates();
+        if (flags & (DISPATCH_VNODE_DELETE | DISPATCH_VNODE_RENAME)) {
+            // File gone — cancel and fall back to directory watch.
+            // Last loaded coords remain active.
+            dispatch_source_cancel(src);
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), q, ^{
+                setupLocationFileWatcher();
+            });
+        }
+    });
+
+    dispatch_source_set_cancel_handler(src, ^{ close(fd); });
+    dispatch_resume(src);
+}
+
+// ─── WKWebView JS timezone injection ─────────────────────────────────────────
+
+static NSString *buildTZScript(NSString *tzID) {
+    return [NSString stringWithFormat:
+        @"(function(){"
+         "  const SPOOF_TZ = '%@';"
+         "  const _OrigDTF = Intl.DateTimeFormat;"
+         "  function patchedDTF(loc, opts) {"
+         "    if (opts && opts.timeZone) return new _OrigDTF(loc, opts);"
+         "    const merged = Object.assign({}, opts, {timeZone: SPOOF_TZ});"
+         "    const fmt = new _OrigDTF(loc, merged);"
+         "    const origRO = fmt.resolvedOptions.bind(fmt);"
+         "    fmt.resolvedOptions = function() { const r = origRO(); r.timeZone = SPOOF_TZ; return r; };"
+         "    return fmt;"
+         "  }"
+         "  patchedDTF.prototype = _OrigDTF.prototype;"
+         "  patchedDTF.supportedLocalesOf = _OrigDTF.supportedLocalesOf.bind(_OrigDTF);"
+         "  Intl.DateTimeFormat = patchedDTF;"
+         "  const _origGTO = Date.prototype.getTimezoneOffset;"
+         "  Date.prototype.getTimezoneOffset = function() {"
+         "    const d = this;"
+         "    const utcMs = Date.UTC(d.getUTCFullYear(),d.getUTCMonth(),d.getUTCDate(),"
+         "                          d.getUTCHours(),d.getUTCMinutes(),d.getUTCSeconds());"
+         "    const local = new _OrigDTF('en-US',{timeZone:SPOOF_TZ,"
+         "                  year:'numeric',month:'2-digit',day:'2-digit',"
+         "                  hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false});"
+         "    const p = local.formatToParts(d).reduce((a,x)=>(a[x.type]=x.value,a),{});"
+         "    const localMs = Date.UTC(+p.year,+p.month-1,+p.day,"
+         "                            p.hour==='24'?0:+p.hour,+p.minute,+p.second);"
+         "    return (utcMs - localMs) / 60000;"
+         "  };"
+         "})();",
+        tzID];
+}
+
+static id (*orig_WKWebView_initWithFrame_configuration)(id, SEL, CGRect, id);
+static id hooked_WKWebView_initWithFrame_configuration(id self_, SEL _cmd, CGRect frame, id configuration) {
+    id wkview = orig_WKWebView_initWithFrame_configuration(self_, _cmd, frame, configuration);
+    NSString *tz = spoofTimezoneID ?: @"UTC";
+    NSString *script = buildTZScript(tz);
+    Class WKUserScript = NSClassFromString(@"WKUserScript");
+    Class WKUContentController = NSClassFromString(@"WKUserContentController");
+    if (!WKUserScript || !WKUContentController) return wkview;
+    // WKUserScriptInjectionTimeAtDocumentStart = 0
+    typedef id (*WKUserScript_init_t)(id, SEL, NSString *, NSInteger, BOOL);
+    SEL initSel = NSSelectorFromString(@"initWithSource:injectionTime:forMainFrameOnly:");
+    id us = ((WKUserScript_init_t)objc_msgSend)([WKUserScript alloc], initSel, script, (NSInteger)0, NO);
+    id ucc = [configuration valueForKey:@"userContentController"];
+    if (ucc) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+        [ucc performSelector:NSSelectorFromString(@"addUserScript:") withObject:us];
+#pragma clang diagnostic pop
+    }
+    debug_print(@"[LocationSpoof] Injected TZ script into WKWebView (tz=%@)", tz);
+    return wkview;
+}
+
+static void injectWKWebView(void) {
+    Class wk = NSClassFromString(@"WKWebView");
+    if (!wk) { debug_print(@"[LocationSpoof] WKWebView not found, skipping JS injection"); return; }
+    SEL sel = @selector(initWithFrame:configuration:);
+    Method m = class_getInstanceMethod(wk, sel);
+    if (!m) { debug_print(@"[LocationSpoof] WKWebView initWithFrame:configuration: not found"); return; }
+    orig_WKWebView_initWithFrame_configuration =
+        (id (*)(id, SEL, CGRect, id))method_getImplementation(m);
+    method_setImplementation(m, (IMP)hooked_WKWebView_initWithFrame_configuration);
+    debug_print(@"[LocationSpoof] WKWebView hook installed");
+}
+
 // ─── Init ─────────────────────────────────────────────────────────────────────
 
 void init() {
+    setenv("TZ", "UTC", 1);
     loadCoordinates();
+    loadPhoneNumber();
+    injectWKWebView();
+    setupLocationFileWatcher();
     proxyMap = [NSMutableDictionary new];
 
     Class loc = [CLLocation class];
@@ -585,6 +736,14 @@ void init() {
                 // Method may not exist yet — add it so it's intercepted if called dynamically.
                 class_addMethod(uiDevice, sfSel, (IMP)hooked_sfRegionCode, "@@:");
             }
+
+            SEL pnSel = NSSelectorFromString(@"phoneNumber");
+            Method pn = class_getInstanceMethod(uiDevice, pnSel);
+            if (pn) {
+                orig_devicePhoneNumber = (NSString *(*)(id, SEL))method_getImplementation(pn);
+                method_setImplementation(pn, (IMP)hooked_devicePhoneNumber);
+                debug_print(@"[LocationSpoof] UIDevice phoneNumber hooked");
+            }
         }
     }
 
@@ -649,16 +808,21 @@ void init() {
         method_setImplementation(sdtz, (IMP)hooked_setDefaultTimeZone);
 
         struct rebinding tz_rebindings[] = {
-            {"CFTimeZoneCopyDefault",         hooked_CFTimeZoneCopyDefault,         (void **)&orig_CFTimeZoneCopyDefault},
-            {"CFTimeZoneCopySystem",          hooked_CFTimeZoneCopySystem,           (void **)&orig_CFTimeZoneCopySystem},
-            {"CFLocaleCopyCurrent",           hooked_CFLocaleCopyCurrent,            (void **)&orig_CFLocaleCopyCurrent},
-            {"CFLocaleCopyPreferredLanguages",hooked_CFLocaleCopyPreferredLanguages, (void **)&orig_CFLocaleCopyPreferredLanguages},
+            {"CFTimeZoneCopyDefault",           hooked_CFTimeZoneCopyDefault,           (void **)&orig_CFTimeZoneCopyDefault},
+            {"CFTimeZoneCopySystem",            hooked_CFTimeZoneCopySystem,             (void **)&orig_CFTimeZoneCopySystem},
+            {"CFLocaleCopyCurrent",             hooked_CFLocaleCopyCurrent,              (void **)&orig_CFLocaleCopyCurrent},
+            {"CFLocaleCopyPreferredLanguages",  hooked_CFLocaleCopyPreferredLanguages,   (void **)&orig_CFLocaleCopyPreferredLanguages},
+            {"CTSettingCopyMyPhoneNumber",      hooked_CTSettingCopyMyPhoneNumber,       (void **)&orig_CTSettingCopyMyPhoneNumber},
         };
-        rebind_symbols(tz_rebindings, 4);
+        rebind_symbols(tz_rebindings, 5);
     }
 
     BOOL needsTimezoneFromGeocoder = !spoofTimezoneID;
     BOOL needsCountryFromGeocoder = !spoofISOCountryCode;
+
+    // Apply UTC immediately so hooks never passthrough to the real timezone
+    // during the async geocoder delay.
+    if (needsTimezoneFromGeocoder) applyTimezone(@"UTC");
 
     if (!needsTimezoneFromGeocoder && !needsCountryFromGeocoder) {
         applyTimezone(spoofTimezoneID);
@@ -697,8 +861,9 @@ void init() {
 #pragma clang diagnostic pop
     }
 
-    debug_print(@"[LocationSpoof] Hooks installed (%.6f, %.6f%@%@%@)", spoofLat, spoofLon,
+    debug_print(@"[LocationSpoof] Hooks installed (%.6f, %.6f%@%@%@%@)", spoofLat, spoofLon,
                 spoofTimezoneID ? [NSString stringWithFormat:@", tz=%@", spoofTimezoneID] : @"",
                 spoofISOCountryCode ? [NSString stringWithFormat:@", iso=%@", spoofISOCountryCode] : @"",
-                spoofMobileCountryCode ? [NSString stringWithFormat:@", mcc=%@", spoofMobileCountryCode] : @"");
+                spoofMobileCountryCode ? [NSString stringWithFormat:@", mcc=%@", spoofMobileCountryCode] : @"",
+                spoofPhoneNumber ? [NSString stringWithFormat:@", phone=%@", spoofPhoneNumber] : @"");
 }
